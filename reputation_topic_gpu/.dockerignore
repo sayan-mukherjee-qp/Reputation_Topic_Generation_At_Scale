@@ -1,0 +1,6 @@
+*
+!pyproject.toml
+!uv.lock
+!*.py
+!README.md
+!DOCKER.md

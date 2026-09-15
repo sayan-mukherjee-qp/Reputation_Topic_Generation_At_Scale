@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Project: large data files ----------------------------------------------
+# Both exceed GitHub's 100 MB per-file limit and are regenerable from the public
+# Kaggle dataset -- see data/README.md. The 150k/200k subsets and the stream
+# chunks are small enough to track, so a clone can still run the pipeline.
+/data/twcs.csv
+/data/twcs_prepared.csv

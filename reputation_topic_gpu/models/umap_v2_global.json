@@ -1,0 +1,38 @@
+{
+  "umap_version": "v1",
+  "scope": "global",
+  "manifolds": [
+    "__global__"
+  ],
+  "embedding_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "input_dimension": 384,
+  "n_components": 5,
+  "n_neighbors": 30,
+  "min_dist": 0.0,
+  "densmap": false,
+  "metric": "cosine",
+  "random_state": 42,
+  "reference_size": 50000,
+  "reference_brands": {
+    "Delta": 4167,
+    "AmericanAir": 4167,
+    "AppleSupport": 4167,
+    "Uber_Support": 4167,
+    "SpotifyCares": 4167,
+    "SouthwestAir": 4167,
+    "TMobileHelp": 4167,
+    "comcastcares": 4167,
+    "McDonalds": 4166,
+    "AmazonHelp": 4166,
+    "MicrosoftHelps": 4166,
+    "VirginTrains": 4166
+  },
+  "per_manifold_reference": {},
+  "reference_window": [
+    "2017-10-01T00:05:58+00:00",
+    "2017-11-19T17:09:46+00:00"
+  ],
+  "umap_learn_version": "0.5.12",
+  "fit_seconds": 52.39,
+  "fitted_at": "2026-09-12T13:28:20.280708+00:00"
+}

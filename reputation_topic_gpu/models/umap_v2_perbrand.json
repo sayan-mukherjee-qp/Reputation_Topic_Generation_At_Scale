@@ -1,0 +1,87 @@
+{
+  "umap_version": "v1",
+  "scope": "per-brand",
+  "manifolds": [
+    "AmazonHelp",
+    "AmericanAir",
+    "AppleSupport",
+    "Delta",
+    "McDonalds",
+    "MicrosoftHelps",
+    "SouthwestAir",
+    "SpotifyCares",
+    "TMobileHelp",
+    "Uber_Support",
+    "VirginTrains",
+    "__global__",
+    "comcastcares"
+  ],
+  "embedding_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "input_dimension": 384,
+  "n_components": 5,
+  "n_neighbors": 30,
+  "min_dist": 0.0,
+  "densmap": false,
+  "metric": "cosine",
+  "random_state": 42,
+  "reference_size": 50000,
+  "reference_brands": {
+    "Delta": 4167,
+    "AmericanAir": 4167,
+    "AppleSupport": 4167,
+    "Uber_Support": 4167,
+    "SpotifyCares": 4167,
+    "SouthwestAir": 4167,
+    "TMobileHelp": 4167,
+    "comcastcares": 4167,
+    "McDonalds": 4166,
+    "AmazonHelp": 4166,
+    "MicrosoftHelps": 4166,
+    "VirginTrains": 4166
+  },
+  "per_manifold_reference": {
+    "AppleSupport": {
+      "reference_size": 4166
+    },
+    "TMobileHelp": {
+      "reference_size": 4166
+    },
+    "AmericanAir": {
+      "reference_size": 4166
+    },
+    "Delta": {
+      "reference_size": 4166
+    },
+    "SouthwestAir": {
+      "reference_size": 4166
+    },
+    "comcastcares": {
+      "reference_size": 4166
+    },
+    "SpotifyCares": {
+      "reference_size": 4166
+    },
+    "Uber_Support": {
+      "reference_size": 4166
+    },
+    "AmazonHelp": {
+      "reference_size": 4166
+    },
+    "VirginTrains": {
+      "reference_size": 4166
+    },
+    "McDonalds": {
+      "reference_size": 4166
+    },
+    "MicrosoftHelps": {
+      "reference_size": 4166
+    }
+  },
+  "reference_window": [
+    "2017-10-01T00:05:58+00:00",
+    "2017-11-19T17:09:46+00:00"
+  ],
+  "umap_learn_version": "0.5.12",
+  "fit_seconds": 122.84,
+  "fitted_at": "2026-09-12T13:33:44.573821+00:00"
+}

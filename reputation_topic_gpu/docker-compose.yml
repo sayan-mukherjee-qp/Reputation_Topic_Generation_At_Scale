@@ -1,0 +1,37 @@
+services:
+  topics:
+    build:
+      context: .
+      args:
+        # cu130 -> driver >= 580; cu126 -> driver >= 560; cpu -> no GPU
+        CUDA_EXTRA: ${CUDA_EXTRA:-cu130}
+    image: reputation-topic-gpu:${CUDA_EXTRA:-cu130}
+    volumes:
+      - ${DATA_DIR:-../data}:/data:ro
+      - ${OUT_DIR:-./out}:/out
+      - topic-cache:/cache
+    environment:
+      # AI Router credentials, only needed for --label-method llm.
+      AIR2_BASE_URL: ${AIR2_BASE_URL:-}
+      AIR2_QP_OAUTH_HOST: ${AIR2_QP_OAUTH_HOST:-}
+      AIR2_S2S_CLIENT_ID: ${AIR2_S2S_CLIENT_ID:-}
+      AIR2_S2S_CLIENT_SECRET: ${AIR2_S2S_CLIENT_SECRET:-}
+      AIR2_CONSUMER_ID: ${AIR2_CONSUMER_ID:-}
+      AIR2_USER_ID: ${AIR2_USER_ID:-}
+    # Large embedding batches use shared memory for dataloader workers.
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - /app/reputation_topic_detection.py
+      - /data/twcs_subset_200k.csv
+      - --out=/out/run1
+      - --embed-cache=/cache/embed
+
+volumes:
+  topic-cache:
