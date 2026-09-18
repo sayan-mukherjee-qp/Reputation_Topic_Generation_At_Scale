@@ -54,6 +54,23 @@ MULTI_PUNCT_RE = re.compile(r"([!?.,])\1{2,}")
 
 DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
+# Peak GPU memory the embedding stage may touch, in GiB. Nothing else in the
+# pipeline uses the GPU -- UMAP is umap-learn/numba and HDBSCAN is sklearn, both
+# CPU -- so capping this one stage caps the whole run. The default suits a small
+# shared cloud GPU; raise it with --max-vram-gb when there is more to spend.
+DEFAULT_MAX_VRAM_GB = 2.0
+
+# Share of the budget handed to activations. The remainder absorbs allocator
+# fragmentation and the transient spike inside a transformer layer, neither of
+# which shows up in a single-batch measurement.
+VRAM_SAFETY_FRACTION = 0.75
+
+# The CUDA context (kernels, cuBLAS workspaces) lives outside the caching
+# allocator, so it is measured and subtracted from the budget rather than
+# ignored. These bound that measurement when another process is sharing the card.
+CUDA_CONTEXT_MIN = 128 * 1024 ** 2
+CUDA_CONTEXT_MAX = 1024 * 1024 ** 2
+
 # Acknowledgement anchors for Layer 1. Only English is listed on purpose: the
 # multilingual encoder places "thanks", "gracias" and "ありがとう" in the same
 # neighbourhood, so English anchors transfer to every language in the corpus
@@ -356,11 +373,18 @@ def parse_args() -> argparse.Namespace:
                    help="Torch device for the embedding model: cuda, cuda:1, cpu, mps. "
                         "Default: cuda when a GPU is visible, else cpu.")
     p.add_argument("--batch-size", type=int, default=None,
-                   help="Embedding batch size. Default: 512 on CUDA, 64 on CPU. "
-                        "Raise it until the GPU is saturated or it runs out of memory.")
+                   help="Embedding batch size. Default on CUDA: measured against --max-vram-gb. "
+                        "An explicit value is still clamped to that budget.")
+    p.add_argument("--max-vram-gb", type=float, default=DEFAULT_MAX_VRAM_GB,
+                   help=f"Hard cap on GPU memory, in GiB (default {DEFAULT_MAX_VRAM_GB}). The batch "
+                        "size is measured against it and the CUDA allocator is capped at it, so the "
+                        "run cannot exceed it. Embedding is the only stage that uses the GPU. "
+                        "Pass 0 to disable the cap.")
     p.add_argument("--fp16", action="store_true",
-                   help="Run the embedding model in half precision on CUDA. Roughly 2x faster "
-                        "with a small numerical difference in the embeddings.")
+                   help="Run the embedding model in half precision on CUDA. Roughly 2x faster, "
+                        "halves the weight and activation memory, and changes the embeddings "
+                        "slightly -- precision is part of the --embed-cache key, so switching "
+                        "re-embeds from scratch rather than reusing fp32 vectors.")
     return p.parse_args()
 
 
@@ -631,8 +655,161 @@ def resolve_device(requested: Optional[str] = None) -> str:
 
 
 def default_batch_size(device: str) -> int:
-    """A GPU is starved by the CPU-era batch of 64; a CPU is not helped by more."""
-    return 512 if str(device).startswith("cuda") else 64
+    """Fallback batch size for when the VRAM budget cannot be measured.
+
+    Only reached on CPU/MPS, or when the cap is disabled with --max-vram-gb 0.
+    On CUDA the batch is calibrated against the budget instead, because the
+    right value depends on the card, the model and the length of the text.
+    """
+    return 256 if str(device).startswith("cuda") else 64
+
+
+def _cuda_index(device: str) -> int:
+    import torch
+    return int(device.split(":")[1]) if ":" in device else torch.cuda.current_device()
+
+
+def apply_vram_cap(device: str, limit_gb: float) -> Optional[int]:
+    """Cap this process's GPU memory at `limit_gb` and return the usable budget.
+
+    Two things happen here. The caching allocator is given a hard ceiling, so
+    the run raises OutOfMemoryError instead of quietly growing past the budget
+    on a shared card. And the CUDA context is measured, because it is allocated
+    outside that ceiling: without subtracting it, a "2 GiB cap" really means
+    2 GiB plus the 250-500 MiB the context costs.
+
+    Returns the bytes left for weights and activations, or None when the device
+    is not CUDA or the cap is disabled.
+    """
+    if not str(device).startswith("cuda") or limit_gb <= 0:
+        return None
+    import torch
+    idx = _cuda_index(device)
+    total = torch.cuda.get_device_properties(idx).total_memory
+
+    # Force the context into existence so the measurement below sees it.
+    torch.zeros(1, device=device)
+    torch.cuda.synchronize(idx)
+    free, _ = torch.cuda.mem_get_info(idx)
+
+    # mem_get_info is device-wide, so a neighbouring process inflates this.
+    # That errs towards a smaller budget, which is the safe direction; the
+    # clamp stops a busy card from driving the budget to nothing.
+    measured = total - free - torch.cuda.memory_reserved(idx)
+    context = int(min(max(measured, CUDA_CONTEXT_MIN), CUDA_CONTEXT_MAX))
+
+    budget = int(limit_gb * 1024 ** 3) - context
+    if budget < 128 * 1024 ** 2:
+        raise RuntimeError(
+            f"--max-vram-gb {limit_gb} leaves only {budget / 1024 ** 2:.0f} MiB after the "
+            f"{context / 1024 ** 2:.0f} MiB CUDA context. Raise the cap, or use --device cpu.")
+
+    torch.cuda.set_per_process_memory_fraction(min(budget / total, 1.0), idx)
+    print(f"VRAM cap: {limit_gb:.2f} GiB "
+          f"({context / 1024 ** 2:.0f} MiB CUDA context + "
+          f"{budget / 1024 ** 2:.0f} MiB allocator budget)")
+    return budget
+
+
+def peak_vram_mib(device: str) -> float:
+    """Highest VRAM this process actually reserved, for the run metadata.
+
+    Reserved rather than allocated: the caching allocator holds on to freed
+    blocks, and that reserved total is what counts against the cap and against
+    anything else sharing the card.
+    """
+    if not str(device).startswith("cuda"):
+        return 0.0
+    try:
+        import torch
+        return torch.cuda.max_memory_reserved(_cuda_index(device)) / 1024 ** 2
+    except Exception:
+        return 0.0
+
+
+def choose_batch_size(
+    model: SentenceTransformer,
+    texts: Sequence[str],
+    device: str,
+    budget: Optional[int],
+    requested: Optional[int] = None,
+    ceiling: int = 1024,
+) -> int:
+    """Size the embedding batch from a measured cost per sample.
+
+    The probe runs on the longest texts in the corpus, not a random sample:
+    attention is quadratic in sequence length, so a batch calibrated on the
+    median text can still fail on the tail.
+
+    An explicit --batch-size is honoured but still clamped to the budget --
+    asking for more than fits is a slower way to hit the same OOM.
+    """
+    if budget is None:
+        return requested or default_batch_size(device)
+
+    import torch
+    probe_n = min(16, len(texts))
+    if probe_n == 0:
+        return requested or default_batch_size(device)
+    longest = sorted(range(len(texts)), key=lambda i: len(texts[i]), reverse=True)[:probe_n]
+
+    idx = _cuda_index(device)
+    torch.cuda.synchronize(idx)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(idx)
+    weights = torch.cuda.memory_allocated(idx)
+
+    # The probe is itself an allocation, and on a very tight budget with a large
+    # model even 16 long texts can overflow it. Shrink rather than abort: a
+    # measurement from one sample is still better than a guess.
+    peak = None
+    while peak is None:
+        try:
+            model.encode([texts[i] for i in longest[:probe_n]], batch_size=probe_n,
+                         show_progress_bar=False, normalize_embeddings=True,
+                         convert_to_numpy=True)
+            torch.cuda.synchronize(idx)
+            peak = torch.cuda.max_memory_allocated(idx)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if probe_n == 1:
+                raise RuntimeError(
+                    f"A single text does not fit the {budget / 1024 ** 2:.0f} MiB budget. "
+                    f"Raise --max-vram-gb, add --fp16, or lower --max-segment-chars.")
+            probe_n = max(1, probe_n // 4)
+            torch.cuda.reset_peak_memory_stats(idx)
+
+    per_sample = max((peak - weights) / probe_n, 1.0)
+    room = budget - weights
+    if room <= 0:
+        raise RuntimeError(
+            f"The model alone needs {weights / 1024 ** 2:.0f} MiB, more than the "
+            f"{budget / 1024 ** 2:.0f} MiB budget. Raise --max-vram-gb, add --fp16, "
+            f"or pick a smaller --model.")
+
+    fitted = int(room * VRAM_SAFETY_FRACTION / per_sample)
+    chosen = max(1, min(fitted, ceiling))
+    if requested:
+        chosen = min(requested, chosen)
+        if chosen < requested:
+            print(f"  --batch-size {requested} does not fit the budget; using {chosen}")
+    print(f"Embedding batch size: {chosen} "
+          f"({weights / 1024 ** 2:.0f} MiB weights + "
+          f"~{per_sample * chosen / 1024 ** 2:.0f} MiB activations "
+          f"in a {budget / 1024 ** 2:.0f} MiB budget)")
+    return chosen
+
+
+def _encode(model: SentenceTransformer, texts: Sequence[str], batch_size: int,
+            progress: bool) -> np.ndarray:
+    emb = model.encode(
+        list(texts),
+        batch_size=batch_size,
+        show_progress_bar=progress,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
+    return emb.astype(np.float32)
 
 
 def describe_device(device: str) -> str:
@@ -655,15 +832,38 @@ def load_embedding_model(model_name: str, device: str, fp16: bool = False) -> Se
     return model
 
 
-def build_embeddings(model: SentenceTransformer, texts: Sequence[str], batch_size: int = 64) -> np.ndarray:
-    emb = model.encode(
-        list(texts),
-        batch_size=batch_size,
-        show_progress_bar=True,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-    )
-    return emb.astype(np.float32)
+def build_embeddings(model: SentenceTransformer, texts: Sequence[str], batch_size: int = 64,
+                     device: str = "cpu", block: int = 50_000, min_batch_size: int = 1) -> np.ndarray:
+    """Encode every text, halving the batch and retrying if CUDA runs out.
+
+    The calibrated batch is an estimate, and an unlucky run of long texts inside
+    one block can still overshoot it. Encoding in blocks means a backoff costs
+    one block rather than the whole corpus. Blocking changes nothing
+    numerically: each text is encoded independently and padding is masked, so
+    the only thing block boundaries affect is padding efficiency.
+    """
+    texts = list(texts)
+    if not str(device).startswith("cuda"):
+        return _encode(model, texts, batch_size, progress=True)
+
+    import torch
+    out: List[np.ndarray] = []
+    bs, i = batch_size, 0
+    while i < len(texts):
+        chunk = texts[i:i + block]
+        try:
+            out.append(_encode(model, chunk, bs, progress=len(texts) <= block))
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if bs <= min_batch_size:
+                raise
+            bs = max(min_batch_size, bs // 2)
+            print(f"  CUDA OOM -> retrying this block at batch size {bs}")
+            continue
+        i += block
+        if len(texts) > block:
+            print(f"  embedded {min(i, len(texts)):,}/{len(texts):,}", flush=True)
+    return np.vstack(out) if out else np.empty((0, 0), dtype=np.float32)
 
 
 def reduce_dimensions(emb: np.ndarray, n_components: int, random_state: int) -> Tuple[np.ndarray, Optional[PCA]]:
@@ -1532,78 +1732,86 @@ def assign_to_topics(
     multi_topic: bool = True,
     max_topics_per_segment: int = 2,
     brand_scoped: bool = False,
+    block_bytes: int = 64 * 1024 ** 2,
 ) -> pd.DataFrame:
-    if not topics:
-        result = segments[["record_id", "segment_id", "segment_index", "event_time", "brand", "clean_text"]].copy()
+    """Assign each segment to its best-matching topics by centroid cosine.
+
+    One chunked matmul rather than a loop over segments. The loop version
+    re-normalised the whole topic matrix on every row, full-sorted every topic
+    to read the top two, and did scalar .iloc lookups per output row; at 159k
+    segments against 400 topics that cost ~44x what the matmul costs.
+
+    The chunk is sized by bytes, not rows, so peak memory stays flat as the
+    topic registry grows across streaming runs -- which is where this stage used
+    to get steadily slower, since its cost is O(segments x topics).
+    """
+    cols = ["record_id", "segment_id", "segment_index", "event_time", "brand", "clean_text"]
+    n = len(segments)
+    if not topics or n == 0:
+        result = segments[cols].copy()
         result["topic_id"] = None
         result["similarity"] = np.nan
         result["assignment_type"] = "UNASSIGNED"
         return result
 
-    topic_matrix = np.asarray([t.centroid for t in topics], dtype=np.float32)
-    rows = []
-    topic_ids = [t.topic_id for t in topics]
+    n_topics = len(topics)
+    topic_ids = np.asarray([t.topic_id for t in topics], dtype=object)
+    # Normalised once here, rather than once per segment inside the loop.
+    topic_matrix = l2_normalize(np.asarray([t.centroid for t in topics], dtype=np.float32))
 
     # Brand scoping. Airlines all discuss delayed flights, so an unscoped
     # nearest-centroid search files a Delta record under an AmericanAir topic:
     # 54.7% of assignments leaked this way. The pooled buckets stay visible
     # because small brands' topics live there.
-    allowed_by_brand: Dict[str, np.ndarray] = {}
+    allow = brand_row = None
     if brand_scoped:
         topic_brands = np.asarray([t.brand for t in topics])
         pooled = np.isin(topic_brands, ["__SMALL_BRANDS__", "GLOBAL"])
-        for b in segments["brand"].astype(str).unique():
+        uniq, brand_row = np.unique(segments["brand"].astype(str).to_numpy(), return_inverse=True)
+        allow = np.empty((len(uniq), n_topics), dtype=bool)
+        for bi, b in enumerate(uniq):
             mask = (topic_brands == b) | pooled
             if not mask.any():          # brand has no topics of its own yet
-                mask = np.ones(len(topics), dtype=bool)
-            allowed_by_brand[b] = np.where(mask)[0]
+                mask = np.ones(n_topics, dtype=bool)
+            allow[bi] = mask
 
-    for i in range(len(segments)):
-        sims = cosine_sim(embeddings[i], topic_matrix)
-        if brand_scoped:
-            allowed = allowed_by_brand.get(str(segments.iloc[i]["brand"]))
-            if allowed is not None and len(allowed) < len(topics):
-                blocked = np.ones(len(topics), dtype=bool)
-                blocked[allowed] = False
-                sims = sims.copy()
-                sims[blocked] = -1.0
-        order = np.argsort(sims)[::-1]
-        chosen = []
-        for j in order:
-            score = float(sims[j])
-            if score < similarity_threshold:
-                break
-            chosen.append((topic_ids[j], score))
-            if not multi_topic or len(chosen) >= max_topics_per_segment:
-                break
+    k = max(1, min(max_topics_per_segment if multi_topic else 1, n_topics))
+    top_idx = np.empty((n, k), dtype=np.int64)
+    top_sim = np.empty((n, k), dtype=np.float32)
 
-        if not chosen:
-            rows.append({
-                "record_id": segments.iloc[i]["record_id"],
-                "segment_id": segments.iloc[i]["segment_id"],
-                "segment_index": segments.iloc[i]["segment_index"],
-                "event_time": segments.iloc[i]["event_time"],
-                "brand": segments.iloc[i]["brand"],
-                "clean_text": segments.iloc[i]["clean_text"],
-                "topic_id": None,
-                "similarity": float(sims[order[0]]) if len(order) else np.nan,
-                "assignment_type": "UNASSIGNED",
-            })
+    step = max(1, block_bytes // (4 * n_topics))
+    for lo in range(0, n, step):
+        hi = min(lo + step, n)
+        sims = l2_normalize(np.asarray(embeddings[lo:hi], dtype=np.float32)) @ topic_matrix.T
+        if allow is not None:
+            sims = np.where(allow[brand_row[lo:hi]], sims, -1.0)
+        if k < n_topics:
+            cand = np.argpartition(-sims, k - 1, axis=1)[:, :k]
         else:
-            for topic_id, score in chosen:
-                rows.append({
-                    "record_id": segments.iloc[i]["record_id"],
-                    "segment_id": segments.iloc[i]["segment_id"],
-                    "segment_index": segments.iloc[i]["segment_index"],
-                    "event_time": segments.iloc[i]["event_time"],
-                    "brand": segments.iloc[i]["brand"],
-                    "clean_text": segments.iloc[i]["clean_text"],
-                    "topic_id": topic_id,
-                    "similarity": score,
-                    "assignment_type": "EXISTING",
-                })
+            cand = np.broadcast_to(np.arange(n_topics), (hi - lo, n_topics))
+        cand_sim = np.take_along_axis(sims, cand, axis=1)
+        order = np.argsort(-cand_sim, axis=1)[:, :k]
+        top_idx[lo:hi] = np.take_along_axis(cand, order, axis=1)
+        top_sim[lo:hi] = np.take_along_axis(cand_sim, order, axis=1)
 
-    return pd.DataFrame(rows)
+    # top_sim is sorted descending, so the rows clearing the threshold are
+    # always a prefix -- the same set the loop's `break` produced.
+    n_chosen = (top_sim >= similarity_threshold).sum(axis=1)
+    counts = np.maximum(n_chosen, 1)            # an unassigned segment still emits one row
+    seg_row = np.repeat(np.arange(n), counts)
+    rank = np.arange(counts.sum()) - np.repeat(np.cumsum(counts) - counts, counts)
+    assigned = np.repeat(n_chosen > 0, counts)
+
+    # Unassigned rows have rank 0, so this reads their best score -- which is
+    # what the loop recorded for them.
+    sim = top_sim[seg_row, rank].astype(float)
+    topic_id = np.where(assigned, topic_ids[top_idx[seg_row, rank]], None)
+
+    out = {c: segments[c].to_numpy()[seg_row] for c in cols}
+    out["topic_id"] = topic_id
+    out["similarity"] = sim
+    out["assignment_type"] = np.where(assigned, "EXISTING", "UNASSIGNED")
+    return pd.DataFrame(out)
 
 
 def map_clusters_to_existing_topics(
@@ -2320,26 +2528,33 @@ def run(args: argparse.Namespace) -> int:
     timer.mark("load + segment", f"{len(segments):,} segments")
 
     _device = resolve_device(getattr(args, "device", None))
-    _batch_size = getattr(args, "batch_size", None) or default_batch_size(_device)
     _fp16 = bool(getattr(args, "fp16", False))
-    print(f"Embedding device: {describe_device(_device)} "
-          f"(batch-size={_batch_size}, fp16={_fp16})")
+    _max_vram = float(getattr(args, "max_vram_gb", DEFAULT_MAX_VRAM_GB))
+    print(f"Embedding device: {describe_device(_device)} (fp16={_fp16})")
+    _vram_budget = apply_vram_cap(_device, _max_vram)
+    if _vram_budget is not None and not _fp16 and _max_vram <= 4.0:
+        print("  note: --fp16 halves weight and activation memory and is ~2x faster; "
+              "it is worth it at this budget.")
 
     _texts = segments["clean_text"].tolist()
     _key = embedding_cache_key(args.model, _texts, "fp16" if _fp16 else "fp32")
     embeddings = load_cached_embeddings(args.embed_cache, _key)
-    if embeddings is not None and len(embeddings) == len(_texts):
-        model = load_embedding_model(args.model, _device, _fp16)
-        timer.mark("model load", f"{args.model.split('/')[-1]} on {_device}")
+    _cached = embeddings is not None and len(embeddings) == len(_texts)
+
+    model = load_embedding_model(args.model, _device, _fp16)
+    timer.mark("model load", f"{args.model.split('/')[-1]} on {_device}")
+    _batch_size = getattr(args, "batch_size", None) or default_batch_size(_device)
+    if _cached:
         timer.mark("embedding (cached)", f"reused {_key}, dim={embeddings.shape[1]}")
     else:
-        model = load_embedding_model(args.model, _device, _fp16)
-        timer.mark("model load", f"{args.model.split('/')[-1]} on {_device}")
+        _batch_size = choose_batch_size(model, _texts, _device, _vram_budget,
+                                        requested=getattr(args, "batch_size", None))
         _emb_t0 = time.perf_counter()
-        embeddings = build_embeddings(model, _texts, batch_size=_batch_size)
+        embeddings = build_embeddings(model, _texts, batch_size=_batch_size, device=_device)
         _emb_dt = max(1e-9, time.perf_counter() - _emb_t0)
         save_cached_embeddings(args.embed_cache, _key, embeddings)
-        timer.mark("embedding", f"{len(segments)/_emb_dt:.1f} seg/s, dim={embeddings.shape[1]}")
+        timer.mark("embedding", f"{len(segments)/_emb_dt:.1f} seg/s, dim={embeddings.shape[1]}"
+                                + (f", peak {peak_vram_mib(_device):.0f} MiB" if _vram_budget else ""))
 
     if args.ack_similarity > 0:
         ack = acknowledgement_similarity(model, embeddings)
@@ -3104,6 +3319,9 @@ def run(args: argparse.Namespace) -> int:
         "embedding_dim": int(embeddings.shape[1]),
         "embedding_precision": "fp16" if _fp16 else "fp32",
         "embedding_device": _device,
+        "embedding_batch_size": int(_batch_size),
+        "max_vram_gb": _max_vram if _vram_budget is not None else None,
+        "peak_vram_mib": round(peak_vram_mib(_device), 1) if _vram_budget is not None else None,
         "reducer": args.reducer,
         "umap": (None if args.reducer != "umap" else {
             "mode": "refit-per-pool" if args.umap_refit_per_pool else "versioned-shared-model",

@@ -1,15 +1,15 @@
 # Containerized GPU run
 
 A self-contained copy of the prototype, packaged with `uv` and built to run on a
-cloud GPU box. The pipeline itself is unchanged apart from three new flags
-(`--device`, `--batch-size`, `--fp16`) that let the embedding stage actually use
-the GPU instead of a CPU-sized batch of 64.
+cloud GPU box. The pipeline itself is unchanged apart from four flags (`--device`,
+`--max-vram-gb`, `--batch-size`, `--fp16`) that let the embedding stage use the
+GPU instead of a CPU-sized batch of 64, within a memory budget you set.
 
 ## What runs on the GPU
 
 | Stage | Device | Note |
 | --- | --- | --- |
-| Sentence-Transformer embedding | **GPU** | The dominant cost on a 200k-record run. Auto-detects CUDA; batch size defaults to 512 there. |
+| Sentence-Transformer embedding | **GPU** | The dominant cost on a 200k-record run. Auto-detects CUDA; the batch is sized to fit `--max-vram-gb`. |
 | Acknowledgement-anchor similarity | **GPU** | Same model, a handful of vectors. |
 | PCA / UMAP reduction | CPU | `umap-learn` and scikit-learn are CPU-only. See *Optional: cuML* below. |
 | HDBSCAN, c-TF-IDF, scoring | CPU | scikit-learn / pandas. |
@@ -73,7 +73,7 @@ docker run --rm --gpus all \
   /app/reputation_topic_detection.py /data/twcs_subset_200k.csv \
     --out /out/run1 \
     --embed-cache /cache/embed \
-    --batch-size 1024 \
+    --max-vram-gb 2 \
     --reducer umap \
     --plots
 ```
@@ -118,13 +118,23 @@ docker compose run --rm topics /app/reputation_topic_detection.py \
 
 ## Tuning the GPU pass
 
-- `--batch-size` defaults to 512 on CUDA. Raise it until either the GPU is
-  saturated (`nvidia-smi dmon`) or it runs out of memory; 1024–2048 is
-  comfortable for MiniLM on a 24 GB card.
-- `--fp16` halves the embedding time on any recent card. It changes the
-  embeddings slightly; precision is part of the embedding-cache key, so an
-  fp16 and an fp32 run can safely share one `--embed-cache` directory without
-  reading back each other's vectors.
+- `--max-vram-gb` (default 2) is a hard ceiling, not a hint. The CUDA context
+  is measured and subtracted from it, and the caching allocator is capped at
+  what is left, so the process cannot exceed the number you give even if the
+  batch estimate is wrong. `run_metadata.json` records the peak actually used.
+  On a card you have to yourself, raise it — the budget is what sets the batch
+  size, so a bigger budget is a bigger batch is a faster pass.
+- `--batch-size` is no longer a guess you have to tune. Leave it off and the
+  batch is measured: a probe on the longest texts in the corpus gives the cost
+  per sample, and the batch is whatever fits the budget. Pass it only to force
+  a smaller value; a larger one is clamped to what fits.
+- `--fp16` halves the embedding time on any recent card, and halves both the
+  weight and activation memory — which on a 2 GiB budget roughly doubles the
+  batch that fits. It changes the embeddings slightly; precision is part of the
+  embedding-cache key, so an fp16 and an fp32 run can safely share one
+  `--embed-cache` directory without reading back each other's vectors.
+- A budget too small for the model fails immediately with what it would need,
+  rather than dying partway through the embedding pass.
 - `--device cuda:1` pins the run to one GPU on a multi-GPU box. The pipeline is
   single-process, so to use several GPUs run several jobs, one per device.
 - `OMP_NUM_THREADS` is set to 8 in the image. On a box with many cores, raise

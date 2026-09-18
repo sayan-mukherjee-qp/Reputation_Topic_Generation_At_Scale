@@ -83,9 +83,16 @@ GPU knobs:
 
 ```bash
 --device cuda:1            # pin to one GPU; default is cuda when one is visible
---batch-size 1024          # default 512 on CUDA, 64 on CPU
---fp16                     # half precision on CUDA, ~2x faster embedding
+--max-vram-gb 2            # hard cap on GPU memory (default 2 GiB)
+--batch-size 1024          # override the batch; still clamped to the VRAM cap
+--fp16                     # half precision on CUDA, ~2x faster, half the memory
 ```
+
+Embedding is the only stage that uses the GPU, so `--max-vram-gb` caps the whole
+run. The batch size is measured against that budget on a probe of the longest
+texts in the corpus rather than guessed, the CUDA allocator is capped so the
+process cannot quietly grow past it on a shared card, and an unlucky block that
+still overflows halves its batch and retries instead of losing the run.
 
 ## What the script does
 
