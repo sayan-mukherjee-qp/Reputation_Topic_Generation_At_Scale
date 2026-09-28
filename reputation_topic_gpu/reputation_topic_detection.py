@@ -71,6 +71,16 @@ VRAM_SAFETY_FRACTION = 0.75
 CUDA_CONTEXT_MIN = 128 * 1024 ** 2
 CUDA_CONTEXT_MAX = 1024 * 1024 ** 2
 
+# Headroom kept below the cap for what the allocator cannot see: cuBLAS/cuDNN
+# workspaces and kernels that load lazily after calibration.
+VRAM_CAP_HEADROOM = 96 * 1024 ** 2
+
+# Expandable segments let the caching allocator grow and shrink in place, so
+# freed activations do not sit in fragmented reserved blocks that count against
+# the cap. Only read when CUDA first initialises, and never overrides a value
+# the operator set.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # Acknowledgement anchors for Layer 1. Only English is listed on purpose: the
 # multilingual encoder places "thanks", "gracias" and "ありがとう" in the same
 # neighbourhood, so English anchors transfer to every language in the corpus
@@ -791,6 +801,105 @@ def apply_vram_cap(device: str, limit_gb: float) -> Optional[int]:
     return budget
 
 
+def _process_vram_bytes(idx: int) -> Optional[int]:
+    """This process's GPU memory as nvidia-smi reports it, via NVML.
+
+    That is the number an operator watches, and it includes the CUDA context
+    and library workspaces that torch.cuda's own counters never see. None when
+    NVML is unavailable.
+    """
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(idx)
+        pid = os.getpid()
+        for fn in ("nvmlDeviceGetComputeRunningProcesses_v3",
+                   "nvmlDeviceGetComputeRunningProcesses_v2",
+                   "nvmlDeviceGetComputeRunningProcesses"):
+            f = getattr(pynvml, fn, None)
+            if f is None:
+                continue
+            for proc in f(h):
+                if proc.pid == pid and proc.usedGpuMemory is not None:
+                    return int(proc.usedGpuMemory)
+            return None
+    except Exception:
+        return None
+    return None
+
+
+class VramGuard:
+    """Holds the whole-process VRAM footprint under --max-vram-gb.
+
+    torch.cuda.set_per_process_memory_fraction caps only the caching
+    allocator. Everything else the process holds on the card -- the CUDA
+    context, cuBLAS/cuDNN handles and workspaces, kernels loaded lazily on the
+    first real forward pass -- sits outside it. Measured once at start-up that
+    overhead looked like ~300 MiB; after the first encode it is several hundred
+    MiB more, which is how a "2 GiB cap" showed up as ~4 GiB in nvidia-smi.
+
+    So the allocator's share is sized AFTER a warm-up encode, from the real
+    overhead, and the process footprint is re-checked while embedding: if it
+    ever exceeds the cap the batch is halved and the cache emptied.
+    """
+
+    def __init__(self, device: str, limit_gb: float) -> None:
+        import torch
+        self.torch = torch
+        self.idx = _cuda_index(device)
+        self.cap = int(limit_gb * 1024 ** 3)
+        self.total = torch.cuda.get_device_properties(self.idx).total_memory
+        self.overhead = 0
+        self.budget = 0
+        self.peak_process = 0
+
+    def process_bytes(self) -> int:
+        """nvidia-smi's view when NVML is present, else allocator + measured overhead."""
+        v = _process_vram_bytes(self.idx)
+        if v is not None:
+            return v
+        return int(self.torch.cuda.memory_reserved(self.idx)) + self.overhead
+
+    def calibrate(self, model: "SentenceTransformer") -> int:
+        """Warm the model up, measure the true non-allocator overhead, set the cap."""
+        torch = self.torch
+        # A few batches of realistic length pull in every kernel and library
+        # handle the real run will use.
+        warm = ["customer support " * 40] * 8
+        model.encode(warm, batch_size=8, show_progress_bar=False, convert_to_numpy=True)
+        torch.cuda.synchronize(self.idx)
+        torch.cuda.empty_cache()
+        reserved = int(torch.cuda.memory_reserved(self.idx))
+        proc = _process_vram_bytes(self.idx)
+        if proc is not None:
+            overhead = proc - reserved
+        else:
+            # Device-wide fallback. A neighbouring process inflates it, which
+            # errs towards a smaller budget -- the safe direction.
+            free, _ = torch.cuda.mem_get_info(self.idx)
+            overhead = (self.total - free) - reserved
+        self.overhead = int(min(max(overhead, CUDA_CONTEXT_MIN), 2 * CUDA_CONTEXT_MAX))
+        self.budget = self.cap - self.overhead - VRAM_CAP_HEADROOM
+        if self.budget < 256 * 1024 ** 2:
+            raise RuntimeError(
+                f"--max-vram-gb {self.cap / 1024 ** 3:.2f} leaves only "
+                f"{self.budget / 1024 ** 2:.0f} MiB after {self.overhead / 1024 ** 2:.0f} MiB of "
+                f"CUDA context and library workspaces. Raise the cap, or use --device cpu.")
+        torch.cuda.set_per_process_memory_fraction(min(self.budget / self.total, 1.0), self.idx)
+        torch.cuda.reset_peak_memory_stats(self.idx)
+        print(f"VRAM cap recalibrated after warm-up: {self.cap / 1024 ** 3:.2f} GiB = "
+              f"{self.overhead / 1024 ** 2:.0f} MiB context/workspaces + "
+              f"{VRAM_CAP_HEADROOM / 1024 ** 2:.0f} MiB headroom + "
+              f"{self.budget / 1024 ** 2:.0f} MiB allocator "
+              f"({'NVML' if proc is not None else 'device-wide estimate'})")
+        return self.budget
+
+    def over_cap(self) -> bool:
+        used = self.process_bytes()
+        self.peak_process = max(self.peak_process, used)
+        return used > self.cap
+
+
 def peak_vram_mib(device: str) -> float:
     """Highest VRAM this process actually reserved, for the run metadata.
 
@@ -913,7 +1022,8 @@ def load_embedding_model(model_name: str, device: str, fp16: bool = False) -> Se
 
 
 def build_embeddings(model: SentenceTransformer, texts: Sequence[str], batch_size: int = 64,
-                     device: str = "cpu", block: int = 50_000, min_batch_size: int = 1) -> np.ndarray:
+                     device: str = "cpu", block: int = 5_000, min_batch_size: int = 1,
+                     guard: Optional["VramGuard"] = None) -> np.ndarray:
     """Encode every text, halving the batch and retrying if CUDA runs out.
 
     The calibrated batch is an estimate, and an unlucky run of long texts inside
@@ -929,6 +1039,7 @@ def build_embeddings(model: SentenceTransformer, texts: Sequence[str], batch_siz
     import torch
     out: List[np.ndarray] = []
     bs, i = batch_size, 0
+    report_every = 50_000
     while i < len(texts):
         chunk = texts[i:i + block]
         try:
@@ -941,7 +1052,16 @@ def build_embeddings(model: SentenceTransformer, texts: Sequence[str], batch_siz
             print(f"  CUDA OOM -> retrying this block at batch size {bs}")
             continue
         i += block
-        if len(texts) > block:
+        # The allocator cap cannot see workspaces or fragmentation, so check
+        # the whole-process footprint between blocks (5k texts, a few seconds
+        # each) and back off before the overshoot can grow.
+        if guard is not None and guard.over_cap():
+            torch.cuda.empty_cache()
+            if guard.over_cap() and bs > min_batch_size:
+                bs = max(min_batch_size, bs // 2)
+                print(f"  process VRAM {guard.peak_process / 1024 ** 2:.0f} MiB > cap "
+                      f"{guard.cap / 1024 ** 2:.0f} MiB -> batch size {bs}")
+        if len(texts) > block and (i % report_every < block or i >= len(texts)):
             print(f"  embedded {min(i, len(texts)):,}/{len(texts):,}", flush=True)
     return np.vstack(out) if out else np.empty((0, 0), dtype=np.float32)
 
@@ -2899,6 +3019,10 @@ def run(args: argparse.Namespace) -> int:
         _slices = list(zip(_bounds[:-1].tolist(), _bounds[1:].tolist()))
 
     model = load_embedding_model(args.model, _device, _fp16)
+    _guard = None
+    if _vram_budget is not None:
+        _guard = VramGuard(_device, _max_vram)
+        _vram_budget = _guard.calibrate(model)
     timer.mark("model load", f"{args.model.split('/')[-1]} on {_device}")
     _batch_size = getattr(args, "batch_size", None) or default_batch_size(_device)
     _emb_parts, _n_cached, _n_fresh, _emb_dt = [], 0, 0, 0.0
@@ -2912,7 +3036,8 @@ def run(args: argparse.Namespace) -> int:
             _batch_size = choose_batch_size(model, _texts, _device, _vram_budget,
                                             requested=getattr(args, "batch_size", None))
             _t0 = time.perf_counter()
-            e = build_embeddings(model, _texts, batch_size=_batch_size, device=_device)
+            e = build_embeddings(model, _texts, batch_size=_batch_size, device=_device,
+                                 guard=_guard)
             _emb_dt += time.perf_counter() - _t0
             save_cached_embeddings(args.embed_cache, _key, e)
             _n_fresh += len(_texts)
@@ -2924,7 +3049,9 @@ def run(args: argparse.Namespace) -> int:
     else:
         timer.mark("embedding", f"{_n_fresh:,} fresh at {_n_fresh/max(1e-9, _emb_dt):.1f} seg/s, "
                                 f"{_n_cached:,} cached, dim={embeddings.shape[1]}"
-                                + (f", peak {peak_vram_mib(_device):.0f} MiB" if _vram_budget else ""))
+                                + (f", allocator peak {peak_vram_mib(_device):.0f} MiB, "
+                                   f"process peak {_guard.peak_process / 1024 ** 2:.0f} MiB "
+                                   f"(cap {_max_vram:.2f} GiB)" if _guard else ""))
 
     if args.ack_similarity > 0:
         ack = acknowledgement_similarity(model, embeddings)
@@ -4014,6 +4141,10 @@ def run(args: argparse.Namespace) -> int:
         "embedding_batch_size": int(_batch_size),
         "max_vram_gb": _max_vram if _vram_budget is not None else None,
         "peak_vram_mib": round(peak_vram_mib(_device), 1) if _vram_budget is not None else None,
+        # What nvidia-smi shows: allocator + CUDA context + library workspaces.
+        "peak_process_vram_mib": (round(_guard.peak_process / 1024 ** 2, 1)
+                                  if _guard is not None and _guard.peak_process else None),
+        "vram_overhead_mib": (round(_guard.overhead / 1024 ** 2, 1) if _guard is not None else None),
         "reducer": args.reducer,
         "umap": (None if args.reducer != "umap" else {
             "mode": "refit-per-pool" if args.umap_refit_per_pool else "versioned-shared-model",

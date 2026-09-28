@@ -17,6 +17,9 @@ dependencies = [
     "umap-learn>=0.5.7,<0.6",
     "numba>=0.61",
     "hf-xet>=1.0",
+    # NVML bindings: lets --max-vram-gb measure the whole process footprint
+    # (what nvidia-smi shows), not just torch's allocator. Pure Python.
+    "nvidia-ml-py>=12",
 ]
 
 # Exactly one of these picks the CUDA build of torch. They are mutually
