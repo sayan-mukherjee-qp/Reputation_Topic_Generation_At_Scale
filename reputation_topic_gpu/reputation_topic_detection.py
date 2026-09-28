@@ -129,6 +129,9 @@ def label_stopwords() -> List[str]:
 
 WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 
+# The LLM's abstain token. Low-confidence answers are mapped onto it too.
+UNCLEAR_LABEL = "Unclear topic"
+
 
 @dataclass
 class Topic:
@@ -149,6 +152,29 @@ class Topic:
     residual_cluster: Optional[bool] = None
     residual_reason: Optional[str] = None
     ack_member_ratio: Optional[float] = None
+    # c-TF-IDF terms behind the label. Kept apart so the junk test still scores
+    # terms after an LLM has replaced the label with prose.
+    keywords: Optional[List[str]] = None
+    description: Optional[str] = None
+    llm_substantive: Optional[bool] = None
+    # Where `label` came from: "llm", "llm_carried" (reused from the previous
+    # batch because the centroid barely moved), "llm_abstain" or "ctfidf".
+    label_source: Optional[str] = None
+    llm_confidence: Optional[float] = None
+    # What the LLM proposed when its answer was turned into an abstain, so a
+    # low-confidence guess stays auditable without reaching a dashboard.
+    llm_proposed_label: Optional[str] = None
+    # Share of members that are one repeated text (URLs/mentions stripped).
+    near_duplicate_ratio: Optional[float] = None
+    campaign_cluster: Optional[bool] = None
+    # Topics in this run (any brand) sharing this exact label: a cross-brand
+    # redundancy signal the per-brand manifolds cannot see geometrically.
+    label_group_size: Optional[int] = None
+    # One-directional quality gate: any negative signal suppresses, nothing
+    # positive rescues. `llm_substantive = True` never overrides a flag.
+    suppressed: Optional[bool] = None
+    suppress_reason: Optional[str] = None
+    alert_suppressed_reason: Optional[str] = None
     tweets: Optional[List[str]] = None
 
 
@@ -183,6 +209,13 @@ class StageTimer:
         self._last = now
         self.marks.append((name, dt))
         print(f"[timing] {name:<26} {dt:8.1f}s   {detail}")
+
+    def as_dict(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for name, dt in self.marks:           # a stage can be marked twice (e.g. umap)
+            out[name] = round(out.get(name, 0.0) + dt, 2)
+        out["TOTAL"] = round(time.perf_counter() - self.t0, 2)
+        return out
 
     def report(self) -> None:
         total = time.perf_counter() - self.t0
@@ -234,12 +267,59 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--label-method", default="tfidf", choices=["tfidf", "ctfidf", "llm"],
                     help="Topic labelling. 'tfidf' scores terms within a topic only, so common words "
                          "win. 'ctfidf' scores across topics, surfacing distinctive terms. 'llm' "
-                         "sends c-TF-IDF terms plus sample tweets to AiRouterV2 for a written label")
-    p.add_argument("--label-llm-usecase", default="reputation-topic-label",
-                    help="AiRouterV2 use-case name. Its prompt, model and output schema live on the "
-                         "use-case in the AiRouterV2 console, not in this client")
+                         "sends c-TF-IDF terms plus sample tweets to the AI Router for a written label")
+    p.add_argument("--label-llm-backend", default="v1", choices=["v1", "air2"],
+                    help="'v1' calls AI Router v1 (/v1/prompt-routes) with the prompt sent inline; "
+                         "credentials from .env (api_key, base_url, use_case). 'air2' calls AiRouterV2, "
+                         "whose prompt lives on a provisioned use-case")
+    p.add_argument("--label-llm-usecase", default=None,
+                    help="Use-case name. Default: use_case from .env for v1, "
+                         "'reputation-topic-label' for air2")
+    p.add_argument("--label-llm-model", default=None,
+                    help="v1 only. Router model name, e.g. gpt-4.1-mini-chat-completion (the default)")
+    p.add_argument("--label-llm-workers", type=int, default=8,
+                    help="v1 only. Concurrent labelling requests")
     p.add_argument("--label-llm-samples", type=int, default=8,
-                    help="Sample tweets sent per topic alongside its terms")
+                    help="Sample tweets sent per topic alongside its terms. Drawn at random "
+                         "(seeded) from distinct member texts, so a mixed cluster looks mixed")
+    p.add_argument("--label-llm-min-confidence", type=float, default=0.7,
+                    help="An LLM label below this confidence is recorded as 'Unclear topic' "
+                         "(the proposal is kept in llm_proposed_label) and not substantive")
+    p.add_argument("--label-reuse-similarity", type=float, default=0.92,
+                    help="Reuse the previous batch's LLM label when a topic's centroid is at "
+                         "least this similar to its previous centroid. Stops per-batch label "
+                         "churn and skips the call. 0 disables")
+    p.add_argument("--label-merge-similarity", type=float, default=0.70,
+                    help="Merge same-brand topics that the LLM gave the identical label when "
+                         "their centroids are at least this similar. Catches over-splits the "
+                         "--duplicate-similarity pass misses. 0 disables")
+    p.add_argument("--history-csv", nargs="*", default=None,
+                    help="Sliding window: earlier chunk CSVs prepended as discovery history. "
+                         "The main CSV becomes the incremental holdout exactly, and each file "
+                         "is embedded (and cached) on its own so the window costs no re-embedding")
+    p.add_argument("--campaign-ratio", type=float, default=0.25,
+                    help="Flag a topic as a coordinated campaign when one repeated text is at "
+                         "least this share of its members")
+    p.add_argument("--campaign-min-size", type=int, default=10)
+    p.add_argument("--max-topics-per-segment", type=int, default=2,
+                    help="Topics a segment may be assigned to. 1 makes size a true count")
+    p.add_argument("--secondary-margin", type=float, default=0.0,
+                    help="A segment's second topic must score within this of its first "
+                         "(0 = any topic clearing the floor)")
+    p.add_argument("--recover-match-existing", action="store_true",
+                    help="Before minting a T_REC topic, match the recovered cluster to an "
+                         "existing same-brand topic (candidate similarity + margin) and file "
+                         "its segments there instead. Recovery minted 34-66 new topics per "
+                         "batch without ever checking the registry")
+    p.add_argument("--max-live-topics", type=int, default=0,
+                    help="Registry capacity. When more topics hold members than this, merge "
+                         "the most similar same-brand pairs (smaller into larger, centroid >= "
+                         "--consolidate-min-similarity) until it fits. 0 disables")
+    p.add_argument("--consolidate-min-similarity", type=float, default=0.75,
+                    help="Never merge below this centroid similarity, even if over capacity")
+    p.add_argument("--retire-idle", action="store_true",
+                    help="Drop a carried-forward topic that received no records anywhere in "
+                         "the window, instead of carrying it as DORMANT again")
     p.add_argument("--micro-clusters", action="store_true",
                     help="Improvement 5: after normal candidate discovery, sweep the leftover pool for "
                          "very small but very tight same-brand groups. Surfaces issues sitting below "
@@ -1733,6 +1813,7 @@ def assign_to_topics(
     max_topics_per_segment: int = 2,
     brand_scoped: bool = False,
     block_bytes: int = 64 * 1024 ** 2,
+    secondary_margin: float = 0.0,
 ) -> pd.DataFrame:
     """Assign each segment to its best-matching topics by centroid cosine.
 
@@ -1770,10 +1851,17 @@ def assign_to_topics(
         uniq, brand_row = np.unique(segments["brand"].astype(str).to_numpy(), return_inverse=True)
         allow = np.empty((len(uniq), n_topics), dtype=bool)
         for bi, b in enumerate(uniq):
-            mask = (topic_brands == b) | pooled
-            if not mask.any():          # brand has no topics of its own yet
-                mask = np.ones(n_topics, dtype=bool)
-            allow[bi] = mask
+            # The pooled buckets exist for brands too small to have topics of
+            # their own. Offering them to every brand let one __SMALL_BRANDS__
+            # topic collect 416 records from the twelve big brands -- the one
+            # mis-tagged topic in out_w300_6.
+            own = topic_brands == b
+            # A brand with neither topics of its own nor pooled buckets stays
+            # unassigned, so candidate discovery can build its topics. Falling
+            # back to "every topic" filed 774 McDonalds/MicrosoftHelps records
+            # under AppleSupport, Uber and Spotify topics when those brands
+            # reappeared after a month of silence.
+            allow[bi] = own if own.any() else pooled
 
     k = max(1, min(max_topics_per_segment if multi_topic else 1, n_topics))
     top_idx = np.empty((n, k), dtype=np.int64)
@@ -1796,7 +1884,14 @@ def assign_to_topics(
 
     # top_sim is sorted descending, so the rows clearing the threshold are
     # always a prefix -- the same set the loop's `break` produced.
-    n_chosen = (top_sim >= similarity_threshold).sum(axis=1)
+    ok = top_sim >= similarity_threshold
+    if secondary_margin > 0 and k > 1:
+        # A second topic only when it is nearly as good as the first: a
+        # genuinely two-topic segment, not a runner-up that merely clears the
+        # floor. This is what held inflation at ~1.8x for nine runs.
+        ok[:, 1:] &= top_sim[:, 1:] >= (top_sim[:, :1] - secondary_margin)
+        ok = np.cumprod(ok, axis=1).astype(bool)
+    n_chosen = ok.sum(axis=1)
     counts = np.maximum(n_chosen, 1)            # an unassigned segment still emits one row
     seg_row = np.repeat(np.arange(n), counts)
     rank = np.arange(counts.sum()) - np.repeat(np.cumsum(counts) - counts, counts)
@@ -1972,10 +2067,14 @@ def prune_buffer(meta: pd.DataFrame, emb: np.ndarray, latest: pd.Timestamp, max_
 
 
 def topics_in_scope(topics: List[Topic], brand: str) -> List[Topic]:
-    """Candidate clusters should match their own brand's topics first; the
-    pooled buckets stay visible because small brands live there."""
-    scoped = [t for t in topics if t.brand in (brand, "__SMALL_BRANDS__", "GLOBAL")]
-    return scoped or topics
+    """Candidate clusters match their own brand's topics. The pooled buckets
+    are only a fallback for a brand that has none of its own, the same rule
+    assignment uses."""
+    own = [t for t in topics if t.brand == brand]
+    if own:
+        return own
+    # Never another brand's topics: an empty scope makes every candidate new.
+    return [t for t in topics if t.brand in ("__SMALL_BRANDS__", "GLOBAL")]
 
 
 def find_micro_clusters(
@@ -2195,6 +2294,23 @@ def gate_alert_surface(
         resid = summary["residual_cluster"].fillna(False).astype(bool)
         fails |= resid
         reason = reason.mask(resid & reason.eq(""), "residual_cluster")
+    if "is_junk" in summary.columns:
+        junk = summary["is_junk"].fillna(False).astype(bool)
+        fails |= junk
+        reason = reason.mask(junk & reason.eq(""), "is_junk")
+    # The LLM signal is one-directional (out_s300_6_llm review, P1). False
+    # suppresses; True rescues nothing -- the 28 topics it called substantive
+    # while is_junk said otherwise averaged C_npmi -0.142. Compared with `is
+    # False` semantics, so a missing judgement (None) never suppresses either.
+    if "llm_substantive" in summary.columns:
+        not_sub = summary["llm_substantive"].map(
+            lambda v: isinstance(v, (bool, np.bool_)) and not bool(v)).astype(bool)
+        fails |= not_sub
+        reason = reason.mask(not_sub & reason.eq(""), "llm_not_substantive")
+    if "campaign_cluster" in summary.columns:
+        camp = summary["campaign_cluster"].fillna(False).astype(bool)
+        fails |= camp
+        reason = reason.mask(camp & reason.eq(""), "campaign_cluster")
 
     demote = summary["status"].isin(["HOT", "TRENDING"]) & fails
     summary["alert_suppressed"] = demote
@@ -2340,10 +2456,208 @@ def load_previous_topics(path: Optional[str]) -> List[Topic]:
     if not path:
         return []
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    fields = set(Topic.__dataclass_fields__)
     topics = []
     for item in payload:
-        topics.append(Topic(**item))
+        topics.append(Topic(**{k: v for k, v in item.items() if k in fields}))
     return topics
+
+
+_ID_NUM_RE = re.compile(r"(\d+)$")
+
+
+def topic_id_floor(*topic_lists: Iterable[Topic]) -> int:
+    """Largest numeric suffix over every ID in play.
+
+    T, T_NEW_, T_REC_ and T_MICRO_ IDs all draw on one counter, so a new ID is
+    only safe when it is above the maximum across ALL of them -- including the
+    carried-forward registry. The counter used to restart at 1 every batch,
+    so batch 2 minted T_REC_161 again while batch 1's T_REC_161 was still
+    being carried forward: 132 duplicate entries and 28.7% phantom volume by
+    batch 6.
+    """
+    hi = 0
+    for lst in topic_lists:
+        for t in lst:
+            m = _ID_NUM_RE.search(str(t.topic_id))
+            if m:
+                hi = max(hi, int(m.group(1)))
+    return hi
+
+
+def dedupe_topic_ids(topics: List[Topic], assigned: Optional[pd.DataFrame] = None) -> Tuple[List[Topic], int]:
+    """Keep exactly one entry per topic_id.
+
+    The survivor is the entry whose brand matches the dominant brand of the
+    topic's members; without members (a loaded registry) it is the largest.
+    Returns the kept list, in first-seen order, and how many entries went.
+    """
+    dominant: Dict[str, str] = {}
+    if assigned is not None and not assigned.empty:
+        a = assigned[assigned["topic_id"].notna()].drop_duplicates(["topic_id", "record_id"])
+        if not a.empty:
+            dominant = (a.groupby("topic_id")["brand"]
+                        .agg(lambda s: s.astype(str).value_counts().index[0]).to_dict())
+    best: Dict[str, int] = {}
+    for i, t in enumerate(topics):
+        j = best.get(t.topic_id)
+        if j is None:
+            best[t.topic_id] = i
+            continue
+        o = topics[j]
+        dom = dominant.get(t.topic_id)
+        score_t = (t.brand == dom, t.size or 0)
+        score_o = (o.brand == dom, o.size or 0)
+        if score_t > score_o:
+            best[t.topic_id] = i
+    keep = sorted(best.values())
+    return [topics[i] for i in keep], len(topics) - len(keep)
+
+
+def sanitize_previous_topics(previous: List[Topic], window_end: pd.Timestamp) -> Dict[str, int]:
+    """Remove knowledge a batch cannot legitimately have.
+
+    A registry seeded from a later corpus carries last_seen_at (and even
+    created_at) values after this batch's own data ends: 359 of 527 topics in
+    batch 1 did. Every lifecycle decision downstream -- retirement, DORMANT,
+    staleness -- was then computed against the future. A timestamp beyond the
+    window is not clamped to the window end (that would claim a sighting at
+    the edge that never happened); it is cleared, and this batch's own
+    assignments set it again from real evidence.
+    """
+    cleared_last = cleared_created = 0
+    if pd.isna(window_end):
+        return {"last_seen_cleared": 0, "created_cleared": 0}
+    for t in previous:
+        ls = pd.to_datetime(t.last_seen_at, errors="coerce", utc=True)
+        if not pd.isna(ls) and ls > window_end:
+            t.last_seen_at = None
+            cleared_last += 1
+        cr = pd.to_datetime(t.created_at, errors="coerce", utc=True)
+        if not pd.isna(cr) and cr > window_end:
+            t.created_at = None
+            cleared_created += 1
+    return {"last_seen_cleared": cleared_last, "created_cleared": cleared_created}
+
+
+def merge_topics_into(topics: List[Topic], assigned: pd.DataFrame,
+                      remap: Dict[str, str]) -> pd.DataFrame:
+    """Fold each `remap` source topic into its target, in place on `topics`.
+
+    The survivor's centroid becomes the size-weighted mean, so it keeps
+    describing everything it now holds; assignments are re-pointed and a
+    segment that already sat on both topics is counted once.
+    """
+    if not remap:
+        return assigned
+    by_id = {t.topic_id: t for t in topics}
+    for src, dst in remap.items():
+        a_, b_ = by_id[dst], by_id[src]
+        w1, w2 = max(1, a_.size or 0), max(1, b_.size or 0)
+        c = (np.asarray(a_.centroid) * w1 + np.asarray(b_.centroid) * w2) / (w1 + w2)
+        a_.centroid = (c / max(np.linalg.norm(c), 1e-12)).astype(np.float32).tolist()
+        a_.size = (a_.size or 0) + (b_.size or 0)
+        if b_.created_at and (not a_.created_at or str(b_.created_at) < str(a_.created_at)):
+            a_.created_at = b_.created_at
+    assigned = assigned.copy()
+    assigned["topic_id"] = assigned["topic_id"].replace(remap)
+    assigned = assigned.drop_duplicates(["segment_id", "topic_id"])
+    topics[:] = [t for t in topics if t.topic_id not in remap]
+    return assigned
+
+
+def consolidate_to_capacity(
+    topics: List[Topic],
+    sizes: Dict[str, int],
+    capacity: int,
+    min_similarity: float,
+    protected: set,
+) -> List[Dict[str, object]]:
+    """Plan merges that bring the number of live topics down to `capacity`.
+
+    The window triples the evidence, but the registry spent it on 49% more
+    topics (541 -> 805), so records per live topic peaked at batch 3 and fell
+    again. Here the most similar same-brand pairs merge first, the smaller
+    into the larger, until the live inventory fits. Topics just minted by
+    candidate discovery are protected -- they are the emerging-topic signal --
+    and a topic that has absorbed others is never itself merged away, so the
+    pass cannot build a chain of increasingly broad topics.
+    """
+    live = [t for t in topics if sizes.get(t.topic_id, 0) > 0]
+    excess = len(live) - capacity
+    if capacity <= 0 or excess <= 0:
+        return []
+    pairs = []
+    by_brand: Dict[str, List[Topic]] = {}
+    for t in live:
+        by_brand.setdefault(t.brand, []).append(t)
+    for grp in by_brand.values():
+        if len(grp) < 2:
+            continue
+        C = l2_normalize(np.asarray([t.centroid for t in grp], dtype=np.float32))
+        S = C @ C.T
+        iu = np.triu_indices(len(grp), 1)
+        keep = S[iu] >= min_similarity
+        for i, j, v in zip(iu[0][keep], iu[1][keep], S[iu][keep]):
+            a, b = grp[i], grp[j]
+            if sizes[a.topic_id] > sizes[b.topic_id]:
+                a, b = b, a                           # a is the smaller one
+            pairs.append((float(v), a, b))
+    pairs.sort(key=lambda x: -x[0])
+    gone, absorbed_into, plan = set(), set(), []
+    for v, a, b in pairs:
+        if len(plan) >= excess:
+            break
+        if a.topic_id in protected:
+            if b.topic_id in protected:
+                continue
+            a, b = b, a                               # never merge a protected topic away
+            if sizes[a.topic_id] > 3 * sizes[b.topic_id]:
+                continue                              # would swallow the big one into a new one
+        if a.topic_id in gone or b.topic_id in gone or a.topic_id in absorbed_into:
+            continue
+        gone.add(a.topic_id)
+        absorbed_into.add(b.topic_id)
+        plan.append({"merged_topic_id": a.topic_id, "into_topic_id": b.topic_id,
+                     "reason": "capacity", "similarity": round(v, 4), "brand": a.brand,
+                     "merged_size": sizes[a.topic_id], "into_size": sizes[b.topic_id]})
+    return plan
+
+
+def near_duplicate_ratio(texts: Sequence[str]) -> float:
+    """Share of members that are the single most repeated text.
+
+    A coordinated campaign -- 38 copies of one vegan-creamer tweet -- scores
+    near-perfect coherence because identical text co-occurs with itself, so
+    coherence alone promotes it. URLs, mentions, digits and punctuation are
+    stripped first so trivially varied copies still count as one.
+    """
+    if not len(texts):
+        return 0.0
+    keys = [WHITESPACE_RE.sub(" ", re.sub(r"[^\w\s]|\d", " ",
+                                            normalize_text(str(t)).lower())).strip()
+            for t in texts]
+    keys = [k for k in keys if k]
+    if not keys:
+        return 0.0
+    top = pd.Series(keys).value_counts().iloc[0]
+    return float(top) / len(texts)
+
+
+def label_sample(texts: Sequence[str], n: int, seed_key: str) -> List[str]:
+    """A seeded random sample of distinct member texts.
+
+    Taking the first n members showed the LLM whatever assignment order put
+    first; a random sample of distinct texts shows it what the cluster is
+    actually made of, which is the only way it can notice a cluster is mixed.
+    """
+    uniq = list(dict.fromkeys(str(t) for t in texts if str(t).strip()))
+    if len(uniq) <= n:
+        return uniq
+    seed = int(hashlib.sha256(seed_key.encode()).hexdigest()[:8], 16)
+    rng = np.random.default_rng(seed)
+    idx = sorted(rng.choice(len(uniq), size=n, replace=False).tolist())
+    return [uniq[i] for i in idx]
 
 
 def stabilize_topics(
@@ -2353,6 +2667,7 @@ def stabilize_topics(
     carry_forward: bool = False,
     max_age_days: int = 0,
     window_end: Optional[pd.Timestamp] = None,
+    label_reuse_similarity: float = 0.0,
 ) -> Tuple[List[Topic], pd.DataFrame]:
     """Match newly discovered clusters to previous topics by original-space centroid similarity.
 
@@ -2375,10 +2690,7 @@ def stabilize_topics(
     prev_matrix = np.asarray([t.centroid for t in previous_topics], dtype=np.float32)
     decisions = []
     max_num = 0
-    for t in previous_topics:
-        m = re.search(r"(\d+)$", t.topic_id)
-        if m:
-            max_num = max(max_num, int(m.group(1)))
+    max_num = topic_id_floor(previous_topics)
     next_num = max_num + 1
 
     # Full new x previous similarity matrix in the original embedding space.
@@ -2424,12 +2736,25 @@ def stabilize_topics(
             t.topic_id = old.topic_id
             t.created_at = old.created_at or t.created_at
             t.status = "ACTIVE"
+            # P6 label stability. A topic whose centroid barely moved is the
+            # same topic; re-asking the LLM every batch gave 385 of 504
+            # persistent topics a different name in all six batches.
+            reused = False
+            if (label_reuse_similarity > 0
+                    and float(sim_matrix[i, j]) >= label_reuse_similarity
+                    and str(old.label_source or "") in ("llm", "llm_carried")):
+                t.label, t.description = old.label, old.description
+                t.llm_substantive, t.llm_confidence = old.llm_substantive, old.llm_confidence
+                t.label_source = "llm_carried"
+                reused = True
             decisions.append({
                 "new_label": t.label,
                 "previous_topic_id": old.topic_id,
+                "previous_label": old.label,
                 "similarity": float(sim_matrix[i, j]),
                 "best_available_similarity": float(sim_matrix[i].max()),
                 "decision": "MATCH_PREVIOUS",
+                "label_reused": reused,
             })
         else:
             t.topic_id = f"T{next_num}"
@@ -2470,6 +2795,8 @@ def stabilize_topics(
                 })
                 continue
             revived = Topic(**{**asdict(old_topic)})
+            if str(revived.label_source or "") == "llm":
+                revived.label_source = "llm_carried"   # centroid unchanged: same topic
             revived.status = "DORMANT"
             revived.size = 0                      # recomputed from this window's assignments
             new_topics.append(revived)
@@ -2491,27 +2818,52 @@ def run(args: argparse.Namespace) -> int:
 
     timer = StageTimer()
     previous_topics = load_previous_topics(args.previous_topics)
-    df = load_data(args.csv, args.text_col, args.time_col, args.brand_col, args.id_col)
-    # Standard internal names so the rest of the pipeline stays simple.
-    df = df.rename(columns={
-        args.time_col: "event_time",
-        args.brand_col: "brand",
-        args.text_col: "text",
-        args.id_col: "tweet_id",
-    })
+    # A registry written before the ID fix can hold the same ID several times;
+    # heal it on the way in so the duplicates cannot be carried forward again.
+    previous_topics, _prev_dupes = dedupe_topic_ids(previous_topics)
+    if _prev_dupes:
+        print(f"Previous registry: dropped {_prev_dupes} duplicate topic_id entries")
 
-    print(f"Loaded {len(df):,} records from {args.csv}")
+    # Sliding window (P2 of the out300 review). History chunks are loaded and
+    # segmented one file at a time, exactly as a single-chunk run would, so
+    # each file's embedding cache key is unchanged and the window re-embeds
+    # nothing it has seen before.
+    def _load(path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        d = load_data(path, args.text_col, args.time_col, args.brand_col, args.id_col)
+        d = d.rename(columns={args.time_col: "event_time", args.brand_col: "brand",
+                              args.text_col: "text", args.id_col: "tweet_id"})
+        sg = segment_records(d, id_col="tweet_id", text_col="text",
+                             max_chars=args.max_segment_chars, overlap_chars=60,
+                             max_segments_per_record=args.max_segments_per_record)
+        return d, sg
+
+    history_files = [h for h in (args.history_csv or []) if h]
+    parts = [_load(h) for h in history_files] + [_load(args.csv)]
+    main_record_ids = set(parts[-1][0]["tweet_id"].astype(str))
+    part_sizes = [len(sg) for _, sg in parts]
+    df = pd.concat([d for d, _ in parts], ignore_index=True)
+    df = df.drop_duplicates("tweet_id", keep="last").sort_values("event_time", kind="stable") \
+           .reset_index(drop=True)
+
+    print(f"Loaded {len(df):,} records from {args.csv}"
+          + (f" + {len(history_files)} history chunk(s) (sliding window)" if history_files else ""))
     print(f"Brands: {df['brand'].nunique():,}")
     print(f"Date range: {df['event_time'].min()} -> {df['event_time'].max()}")
 
-    segments = segment_records(
-        df,
-        id_col="tweet_id",
-        text_col="text",
-        max_chars=args.max_segment_chars,
-        overlap_chars=60,
-        max_segments_per_record=args.max_segments_per_record,
-    )
+    window_end = pd.to_datetime(df["event_time"], errors="coerce", utc=True).max()
+    lifecycle_fix = sanitize_previous_topics(previous_topics, window_end)
+    if any(lifecycle_fix.values()):
+        print(f"Previous registry: cleared future timestamps beyond {window_end} -- "
+              f"last_seen_at on {lifecycle_fix['last_seen_cleared']}, "
+              f"created_at on {lifecycle_fix['created_cleared']} topics")
+
+    segments = pd.concat([sg for _, sg in parts], ignore_index=True)
+    if len(parts) > 1:
+        # Only duplicates across files; a record belongs to the newest file.
+        _dup = segments["segment_id"].duplicated(keep="last")
+        if _dup.any():
+            segments = segments[~_dup].reset_index(drop=True)
+            part_sizes = None                      # per-file cache no longer aligned
     print(f"Created {len(segments):,} semantic units from {segments['record_id'].nunique():,} records.")
     print(f"Segment expansion factor: {len(segments)/max(1, len(df)):.2f}x")
 
@@ -2536,24 +2888,42 @@ def run(args: argparse.Namespace) -> int:
         print("  note: --fp16 halves weight and activation memory and is ~2x faster; "
               "it is worth it at this budget.")
 
-    _texts = segments["clean_text"].tolist()
-    _key = embedding_cache_key(args.model, _texts, "fp16" if _fp16 else "fp32")
-    embeddings = load_cached_embeddings(args.embed_cache, _key)
-    _cached = embeddings is not None and len(embeddings) == len(_texts)
+    _prec = "fp16" if _fp16 else "fp32"
+    _all_texts = segments["clean_text"].tolist()
+    # One cache entry per input file (its own text list), so a sliding window
+    # reuses each chunk's vectors from the run that first embedded it.
+    if part_sizes is None:
+        _slices = [(0, len(_all_texts))]
+    else:
+        _bounds = np.cumsum([0] + part_sizes)
+        _slices = list(zip(_bounds[:-1].tolist(), _bounds[1:].tolist()))
 
     model = load_embedding_model(args.model, _device, _fp16)
     timer.mark("model load", f"{args.model.split('/')[-1]} on {_device}")
     _batch_size = getattr(args, "batch_size", None) or default_batch_size(_device)
-    if _cached:
-        timer.mark("embedding (cached)", f"reused {_key}, dim={embeddings.shape[1]}")
+    _emb_parts, _n_cached, _n_fresh, _emb_dt = [], 0, 0, 0.0
+    for lo, hi in _slices:
+        _texts = _all_texts[lo:hi]
+        _key = embedding_cache_key(args.model, _texts, _prec)
+        e = load_cached_embeddings(args.embed_cache, _key)
+        if e is not None and len(e) == len(_texts):
+            _n_cached += len(_texts)
+        else:
+            _batch_size = choose_batch_size(model, _texts, _device, _vram_budget,
+                                            requested=getattr(args, "batch_size", None))
+            _t0 = time.perf_counter()
+            e = build_embeddings(model, _texts, batch_size=_batch_size, device=_device)
+            _emb_dt += time.perf_counter() - _t0
+            save_cached_embeddings(args.embed_cache, _key, e)
+            _n_fresh += len(_texts)
+        _emb_parts.append(e)
+    embeddings = np.vstack(_emb_parts).astype(np.float32)
+    if _n_fresh == 0:
+        timer.mark("embedding (cached)", f"reused {len(_slices)} cache entr(y/ies), "
+                                         f"dim={embeddings.shape[1]}")
     else:
-        _batch_size = choose_batch_size(model, _texts, _device, _vram_budget,
-                                        requested=getattr(args, "batch_size", None))
-        _emb_t0 = time.perf_counter()
-        embeddings = build_embeddings(model, _texts, batch_size=_batch_size, device=_device)
-        _emb_dt = max(1e-9, time.perf_counter() - _emb_t0)
-        save_cached_embeddings(args.embed_cache, _key, embeddings)
-        timer.mark("embedding", f"{len(segments)/_emb_dt:.1f} seg/s, dim={embeddings.shape[1]}"
+        timer.mark("embedding", f"{_n_fresh:,} fresh at {_n_fresh/max(1e-9, _emb_dt):.1f} seg/s, "
+                                f"{_n_cached:,} cached, dim={embeddings.shape[1]}"
                                 + (f", peak {peak_vram_mib(_device):.0f} MiB" if _vram_budget else ""))
 
     if args.ack_similarity > 0:
@@ -2575,7 +2945,14 @@ def run(args: argparse.Namespace) -> int:
 
     # Split by time to emulate real production behavior:
     # older history creates topics; latest period arrives incrementally.
-    if args.test_fraction > 0 and 0 < args.test_fraction < 0.5:
+    if history_files:
+        # The window's newest chunk is the incremental holdout, exactly: older
+        # chunks are evidence for discovery, the new chunk is what "arrived".
+        test_mask = segments["record_id"].astype(str).isin(main_record_ids).to_numpy()
+        train_mask = ~test_mask
+        cutoff_time = pd.to_datetime(segments.loc[test_mask, "event_time"],
+                                     errors="coerce", utc=True).min()
+    elif args.test_fraction > 0 and 0 < args.test_fraction < 0.5:
         cutoff_idx = int(math.floor(len(df) * (1.0 - args.test_fraction)))
         cutoff_time = df.iloc[cutoff_idx]["event_time"]
         train_mask = segments["event_time"] < cutoff_time
@@ -2744,11 +3121,18 @@ def run(args: argparse.Namespace) -> int:
             topics, previous_topics, threshold=args.candidate_similarity,
             carry_forward=args.carry_forward_topics,
             max_age_days=args.topic_max_age_days,
-            window_end=_win_end)
+            window_end=_win_end,
+            label_reuse_similarity=(args.label_reuse_similarity
+                                    if args.label_method == "llm" else 0.0))
         if not stability.empty:
             stability.to_csv(out_dir / "topic_stability_decisions.csv", index=False)
             print("\nCross-run topic stability decisions:")
             print(stability["decision"].value_counts().to_string())
+
+    # P0. Every ID minted from here on (T_NEW_, T_REC_, T_MICRO_) must clear
+    # the whole registry, not just this run's discovery count.
+    next_global_topic_num = max(next_global_topic_num,
+                                topic_id_floor(topics, previous_topics) + 1)
 
     # If clustering produced nothing, fail loudly with enough diagnostic context.
     if not topics:
@@ -2773,9 +3157,10 @@ def run(args: argparse.Namespace) -> int:
         train_embeddings,
         topics,
         similarity_threshold=max(0.50, args.min_similarity - 0.10),
-        multi_topic=True,
-        max_topics_per_segment=2,
+        multi_topic=args.max_topics_per_segment > 1,
+        max_topics_per_segment=args.max_topics_per_segment,
         brand_scoped=args.brand_scoped_assignment,
+        secondary_margin=args.secondary_margin,
     )
 
     timer.mark("history re-assignment", f"{len(discovery_assignments):,} rows")
@@ -2786,9 +3171,10 @@ def run(args: argparse.Namespace) -> int:
         recent_embeddings,
         topics,
         similarity_threshold=args.min_similarity,
-        multi_topic=True,
-        max_topics_per_segment=2,
+        multi_topic=args.max_topics_per_segment > 1,
+        max_topics_per_segment=args.max_topics_per_segment,
         brand_scoped=args.brand_scoped_assignment,
+        secondary_margin=args.secondary_margin,
     )
 
     assigned = recent_assignments[recent_assignments["topic_id"].notna()].copy()
@@ -2806,6 +3192,18 @@ def run(args: argparse.Namespace) -> int:
     buffer_meta, buffer_emb = load_unassigned_buffer(args.buffer, emb_dim)
     if len(buffer_meta):
         print(f"Rolling buffer: carried {len(buffer_meta):,} segments in from previous runs.")
+        if history_files:
+            # Under a sliding window the buffer's segments are usually inside
+            # the window's history already. The ones history re-assignment
+            # explained are done; only the still-unexplained stay candidates.
+            _hist_claimed = set(discovery_assignments.loc[
+                discovery_assignments["topic_id"].notna(), "segment_id"])
+            _drop = buffer_meta["segment_id"].isin(_hist_claimed).to_numpy()
+            if _drop.any():
+                buffer_meta = buffer_meta.loc[~_drop].reset_index(drop=True)
+                buffer_emb = buffer_emb[~_drop]
+                print(f"  {int(_drop.sum()):,} already explained by the window's history; "
+                      f"{len(buffer_meta):,} remain candidates")
 
     if not unassigned.empty:
         uids = unassigned["segment_id"].tolist()
@@ -2840,9 +3238,15 @@ def run(args: argparse.Namespace) -> int:
         pool_counts = pool_meta.groupby("brand")["record_id"].nunique().to_dict()
         cand_groups = []
         cand_small = []
+        # A brand that already has topics of its own never joins the pooled
+        # bucket, however thin its leftovers are this run: pooling the thin
+        # remainders of six big brands is how __SMALL_BRANDS__ grew a topic of
+        # AmericanAir, Spotify and T-Mobile tweets. Its leftovers either cluster
+        # on their own or wait in the buffer for more evidence.
+        _own_brands = {t.brand for t in topics} - {"__SMALL_BRANDS__", "GLOBAL"}
         for brand, n in pool_counts.items():
             idx = pool_meta.index[pool_meta["brand"] == brand].to_numpy()
-            if n >= args.brand_min_records:
+            if n >= args.brand_min_records or brand in _own_brands:
                 cand_groups.append((brand, idx))
             else:
                 cand_small.extend(idx.tolist())
@@ -2927,6 +3331,7 @@ def run(args: argparse.Namespace) -> int:
             print(f"\nRecovery pass: {len(rec_idx):,} unexplained segments, "
                   f"{int(content_ok.sum()):,} contentful (>= {args.recover_min_content_words} content words)")
             rec_claimed = []
+            rec_matched = 0
             for brand_key in sorted(rec_meta.loc[content_ok, "brand"].astype(str).unique()):
                 sel = np.where(content_ok & (rec_meta["brand"].astype(str).to_numpy() == brand_key))[0]
                 if len(sel) < max(2 * args.recover_min_cluster_size, 20):
@@ -2943,9 +3348,31 @@ def run(args: argparse.Namespace) -> int:
                 if not r_cents:
                     continue
                 b_meta = rec_meta.loc[sel].reset_index(drop=True)
+                scope = topics_in_scope(topics, brand_key) if args.recover_match_existing else []
+                if scope:
+                    S_mat = np.asarray([t.centroid for t in scope], dtype=np.float32)
+                    S_mat = S_mat / np.clip(np.linalg.norm(S_mat, axis=1, keepdims=True), 1e-12, None)
                 for cid, centroid in r_cents.items():
                     mask = r_labels == cid
                     rows = b_meta.loc[mask]
+                    if scope:
+                        # Same test candidate discovery applies: clear the
+                        # candidate threshold AND beat the runner-up by the
+                        # margin, or it is not evidence of belonging.
+                        sims = S_mat @ (centroid / max(np.linalg.norm(centroid), 1e-12))
+                        order = np.argsort(-sims)
+                        best = float(sims[order[0]])
+                        second = float(sims[order[1]]) if len(order) > 1 else -1.0
+                        if best >= args.candidate_similarity and best - second >= args.candidate_margin:
+                            tgt = scope[int(order[0])]
+                            local = rows.copy()
+                            local["topic_id"] = tgt.topic_id
+                            local["similarity"] = best
+                            local["assignment_type"] = "RECOVERED_EXISTING"
+                            rec_claimed.append(local)
+                            rec_matched += 1
+                            absorbed[rec_idx[sel[mask]]] = True
+                            continue
                     tid = f"T_REC_{next_global_topic_num}"
                     next_global_topic_num += 1
                     ts_ = pd.to_datetime(rows["event_time"], errors="coerce")
@@ -2976,6 +3403,7 @@ def run(args: argparse.Namespace) -> int:
                 if not unassigned.empty:
                     unassigned = unassigned[~unassigned["segment_id"].isin(_rec_ids)]
                 print(f"  recovered {n_rec:,} segments into {len(recovered_topics)} new topics "
+                      f"and {rec_matched} clusters filed under existing topics "
                       f"({len(_rec_ids):,} removed from the unassigned list)")
             else:
                 print("  nothing clustered above the recovery threshold")
@@ -3039,26 +3467,94 @@ def run(args: argparse.Namespace) -> int:
     timer.mark("candidate discovery", f"{len(new_topics)} emerging")
 
     # Combine history + incoming data. We use distinct records for downstream counting.
+    # A buffered history segment claimed by candidate discovery must not also
+    # stay behind as an UNASSIGNED history row.
+    _claimed_ids = set(assigned.loc[assigned["topic_id"].notna(), "segment_id"])
+    _stale = discovery_assignments["topic_id"].isna() & \
+        discovery_assignments["segment_id"].isin(_claimed_ids)
+    if _stale.any():
+        discovery_assignments = discovery_assignments[~_stale]
     assigned = pd.concat([discovery_assignments, assigned], ignore_index=True)
 
-    # Topic size should be distinct records, not chunks.
-    topic_sizes = assigned.drop_duplicates(["record_id", "topic_id"]).groupby("topic_id")["record_id"].nunique()
-    for topic in topics:
-        topic.size = int(topic_sizes.get(topic.topic_id, topic.size))
+    # P1 (out300w review). Registry capacity.
+    merge_log: List[Dict[str, object]] = []
+    if args.max_live_topics > 0:
+        _sz = (assigned[assigned["topic_id"].notna()].drop_duplicates(["record_id", "topic_id"])
+               .groupby("topic_id")["record_id"].nunique().to_dict())
+        for t in topics:
+            t.size = int(_sz.get(t.topic_id, 0))
+        _protected = {t.topic_id for t in new_topics} | {t.topic_id for t in micro_topics}
+        _n_live = sum(1 for t in topics if t.size > 0)
+        plan = consolidate_to_capacity(topics, _sz, args.max_live_topics,
+                                       args.consolidate_min_similarity, _protected)
+        if plan:
+            assigned = merge_topics_into(topics, assigned,
+                                         {p["merged_topic_id"]: p["into_topic_id"] for p in plan})
+            merge_log.extend(plan)
+        print(f"Capacity: {_n_live} live topics against a cap of {args.max_live_topics}; "
+              f"{len(plan)} merged (centroid >= {args.consolidate_min_similarity}), "
+              f"{_n_live - len(plan)} live now")
+        timer.mark("consolidation", f"{len(plan)} merges")
 
-    # Time-series counts: one record can contribute to multiple topics, but only once per topic/day.
-    counts = unique_record_topic_counts(assigned)
-    ts = build_complete_timeseries(counts, topics)
-    hot = add_hot_scores(ts)
+    # ---- Evidence per topic: members, coherence, residual flags -------------
+    # Computed BEFORE labelling so the LLM can be shown them (P3), and wrapped
+    # in a function because a label-driven merge (P4) changes membership and
+    # has to recompute everything that depends on it.
+    llm_info: Dict[str, object] = {"enabled": args.label_method == "llm"}
+    analyzer = CountVectorizer(token_pattern=r"(?u)\b[a-z][a-z']{2,}\b",
+                               lowercase=True).build_analyzer()
+    coherence_corpus = segments["clean_text"].astype(str).tolist()
 
-    # Member texts per topic, used by both coherence and the junk signals.
-    members = (assigned[assigned["topic_id"].notna()]
-               .dropna(subset=["clean_text"])
-               .drop_duplicates(["topic_id", "record_id"]))
-    member_texts = {tid: g["clean_text"].astype(str).tolist()
-                    for tid, g in members.groupby("topic_id", sort=False)}
+    def build_evidence(assigned: pd.DataFrame, which: Optional[set] = None):
+        """Sizes, member texts, coherence, campaign and residual flags.
 
-    if args.label_method in ("ctfidf", "llm"):
+        `which` limits the recompute to the topics whose membership changed.
+        """
+        topic_sizes = (assigned.drop_duplicates(["record_id", "topic_id"])
+                       .groupby("topic_id")["record_id"].nunique())
+        for topic in topics:
+            if which is None or topic.topic_id in which:
+                topic.size = int(topic_sizes.get(topic.topic_id, topic.size))
+        members = (assigned[assigned["topic_id"].notna()]
+                   .dropna(subset=["clean_text"])
+                   .drop_duplicates(["topic_id", "record_id"]))
+        member_texts = {tid: g["clean_text"].astype(str).tolist()
+                        for tid, g in members.groupby("topic_id", sort=False)}
+        todo = [t for t in topics if which is None or t.topic_id in which]
+
+        # P5 near-duplicate campaign guard.
+        for t in todo:
+            txts = member_texts.get(t.topic_id, [])
+            r = near_duplicate_ratio(txts)
+            t.near_duplicate_ratio = round(r, 4)
+            t.campaign_cluster = bool(len(txts) >= args.campaign_min_size
+                                      and r >= args.campaign_ratio)
+
+        if not args.no_coherence:
+            topic_terms = {}
+            for t in todo:
+                cnt: Dict[str, int] = {}
+                # Distinct texts only: 38 copies of one tweet otherwise score
+                # near-perfect coherence by co-occurring with themselves.
+                for txt in dict.fromkeys(member_texts.get(t.topic_id, [])):
+                    for w in set(analyzer(txt)):
+                        if w not in content_stop:
+                            cnt[w] = cnt.get(w, 0) + 1
+                topic_terms[t.topic_id] = [w for w, _ in
+                                           sorted(cnt.items(), key=lambda kv: -kv[1])[:10]]
+            coh_map = npmi_coherence(topic_terms, coherence_corpus)
+            for t in todo:
+                c = coh_map.get(t.topic_id, float("nan"))
+                t.coherence = None if not np.isfinite(c) else round(float(c), 6)
+
+        # P2. Identify conversational grab-bags before anything ranks them.
+        _any = assigned[assigned["topic_id"].notna()]
+        _members = {tid: grp["clean_text"].astype(str).tolist()
+                    for tid, grp in _any.groupby("topic_id")}
+        n_resid = flag_residual_clusters(todo, _members, args.residual_ack_ratio)
+        return member_texts, n_resid
+
+    def build_keywords(member_texts: Dict[str, List[str]]) -> int:
         # Score topics against others of the SAME brand. Scoring across all
         # brands makes the brand's own name look distinctive, so Delta topics
         # came back labelled "flight / delta / flights". Within the brand its
@@ -3073,55 +3569,188 @@ def run(args: argparse.Namespace) -> int:
             # to the global pool so it still gets a label.
             new_labels.update(ctfidf_labels(group, top_n=5) if len(group) > 1
                               else ctfidf_labels(member_texts, top_n=5))
-        relabelled = 0
+        n = 0
         for t in topics:
             terms = new_labels.get(t.topic_id)
             if terms:
-                t.label = " / ".join(terms)
-                relabelled += 1
-        print(f"Labelling: c-TF-IDF relabelled {relabelled:,} of {len(topics):,} topics.")
+                t.keywords = list(terms)
+                # An LLM label (fresh or carried) is never overwritten by terms.
+                if not str(t.label_source or "").startswith("llm"):
+                    t.label = " / ".join(terms)
+                    t.label_source = "ctfidf"
+                n += 1
+            else:
+                # Dormant topics have no members to score; keep their last terms
+                # rather than shipping keywords: null, and say where the label
+                # came from rather than shipping label_source: null.
+                if t.keywords is None and " / " in str(t.label):
+                    t.keywords = [x.strip() for x in str(t.label).split(" / ") if x.strip()]
+                if t.label_source is None:
+                    t.label_source = "ctfidf" if " / " in str(t.label) else "carried"
+        return n
+
+    member_texts, _n_resid = build_evidence(assigned)
+    if not args.no_coherence:
+        timer.mark("coherence scoring", f"{len(topics):,} topics")
+
+    if args.label_method in ("ctfidf", "llm"):
+        relabelled = build_keywords(member_texts)
+        print(f"Labelling: c-TF-IDF keywords for {relabelled:,} of {len(topics):,} topics.")
 
     if args.label_method == "llm":
+        _llm_t0 = time.perf_counter()
+        # Reused labels skip the call; abstains are re-asked, because the
+        # window may now hold enough evidence to name them.
+        todo = [t for t in topics
+                if member_texts.get(t.topic_id)
+                and not (t.label_source == "llm_carried"
+                         and t.label != UNCLEAR_LABEL)]
+        n_reused = sum(1 for t in topics if t.label_source == "llm_carried"
+                       and t.label != UNCLEAR_LABEL)
+        n_ok = n_abstain = 0
         try:
-            from air2_client import Air2Client, Air2ConfigError
-            client = Air2Client()
-            n_ok = 0
-            for t in topics:
-                texts = member_texts.get(t.topic_id, [])[: args.label_llm_samples]
-                label = client.label_topic(
-                    use_case=args.label_llm_usecase,
-                    brand=t.brand,
-                    terms=t.label.split(" / "),
-                    samples=texts,
-                )
-                if label:
-                    t.label = label
+            if args.label_llm_backend == "v1":
+                from airouter_v1_client import AiRouterV1Client
+                client = AiRouterV1Client(model=args.label_llm_model, use_case=args.label_llm_usecase)
+                llm_info.update(client.config())
+                items = []
+                for t in todo:
+                    items.append((
+                        t.brand, t.keywords or t.label.split(" / "),
+                        label_sample(member_texts.get(t.topic_id, []), args.label_llm_samples,
+                                     t.topic_id),
+                        {"member_count": int(t.size or 0),
+                         "coherence": None if t.coherence is None else round(t.coherence, 3),
+                         "residual_cluster": bool(t.residual_cluster)},
+                    ))
+                results = client.label_topics(items, workers=args.label_llm_workers)
+                for t, res in zip(todo, results):
+                    if not res:
+                        continue
+                    label, desc, sub, conf = res
                     n_ok += 1
-            print(f"Labelling: LLM named {n_ok:,} of {len(topics):,} topics.")
+                    t.description, t.llm_confidence = desc, conf
+                    t.llm_proposed_label = None
+                    abstain = label.strip().lower() == UNCLEAR_LABEL.lower()
+                    if (not abstain and conf is not None
+                            and conf < args.label_llm_min_confidence):
+                        # P3. A low-confidence name is an abstain, not an assertion.
+                        t.llm_proposed_label = label
+                        abstain = True
+                    if abstain:
+                        t.label, t.llm_substantive, t.label_source = UNCLEAR_LABEL, False, "llm_abstain"
+                        n_abstain += 1
+                    else:
+                        t.label, t.llm_substantive, t.label_source = label, sub, "llm"
+                llm_info["stats"] = client.summary()
+            else:
+                from air2_client import Air2Client
+                client = Air2Client()
+                llm_info.update({"backend": "air2",
+                                 "use_case": args.label_llm_usecase or "reputation-topic-label"})
+                for t in todo:
+                    texts = label_sample(member_texts.get(t.topic_id, []),
+                                         args.label_llm_samples, t.topic_id)
+                    label = client.label_topic(
+                        use_case=args.label_llm_usecase or "reputation-topic-label",
+                        brand=t.brand,
+                        terms=t.keywords or t.label.split(" / "),
+                        samples=texts,
+                    )
+                    if label:
+                        t.label, t.label_source = label, "llm"
+                        n_ok += 1
+            print(f"Labelling: LLM ({args.label_llm_backend}) named {n_ok:,} of {len(todo):,} "
+                  f"requested ({n_abstain:,} abstained as '{UNCLEAR_LABEL}'); "
+                  f"{n_reused:,} labels reused from the previous batch.")
         except Exception as exc:
+            llm_info["error"] = str(exc)
             print(f"Labelling: LLM unavailable ({exc}); keeping c-TF-IDF labels.", file=sys.stderr)
+        llm_info.update({
+            "samples_per_topic": int(args.label_llm_samples),
+            "workers": int(args.label_llm_workers),
+            "min_confidence": float(args.label_llm_min_confidence),
+            "reuse_similarity": float(args.label_reuse_similarity),
+            "requested": len(todo), "labelled": n_ok,
+            "failed": len(todo) - n_ok, "abstained": n_abstain, "reused": n_reused,
+            "seconds": round(time.perf_counter() - _llm_t0, 1),
+        })
+        timer.mark("llm labelling", f"{n_ok:,}/{len(todo):,} called, {n_reused:,} reused")
 
-    if not args.no_coherence:
-        analyzer = CountVectorizer(token_pattern=r"(?u)\b[a-z][a-z']{2,}\b",
-                                   lowercase=True).build_analyzer()
-        topic_terms = {}
-        for t in topics:
-            cnt: Dict[str, int] = {}
-            for txt in member_texts.get(t.topic_id, []):
-                for w in set(analyzer(txt)):
-                    if w not in content_stop:
-                        cnt[w] = cnt.get(w, 0) + 1
-            topic_terms[t.topic_id] = [w for w, _ in
-                                       sorted(cnt.items(), key=lambda kv: -kv[1])[:10]]
-        coh_map = npmi_coherence(topic_terms, segments["clean_text"].astype(str).tolist())
-        for t in topics:
-            c = coh_map.get(t.topic_id, float("nan"))
-            t.coherence = None if not np.isfinite(c) else round(float(c), 6)
-        timer.mark("coherence scoring", f"{len(coh_map):,} topics")
+        # P4. Identical labels as a merge signal. Within a brand, two topics
+        # the LLM independently named the same, whose centroids are close, are
+        # an over-split the 0.92 centroid merge missed. The abstain token is
+        # never a reason to merge: "Unclear" is not a shared subject.
+        label_merges = []
+        if args.label_merge_similarity > 0:
+            groups: Dict[Tuple[str, str], List[Topic]] = {}
+            for t in topics:
+                if (t.label_source in ("llm", "llm_carried") and t.label != UNCLEAR_LABEL
+                        and (t.size or 0) > 0):
+                    groups.setdefault((t.brand, t.label.strip().lower()), []).append(t)
+            remap: Dict[str, str] = {}
+            for (_b, _l), grp in groups.items():
+                if len(grp) < 2:
+                    continue
+                grp = sorted(grp, key=lambda t: -(t.size or 0))
+                keep_ = []
+                for t in grp:
+                    ct = np.asarray(t.centroid, dtype=np.float32)
+                    into = None
+                    for k in keep_:
+                        if float(cosine_sim(ct, np.asarray(k.centroid, dtype=np.float32)[None, :])[0]) \
+                                >= args.label_merge_similarity:
+                            into = k
+                            break
+                    if into is None:
+                        keep_.append(t)
+                    else:
+                        remap[t.topic_id] = into.topic_id
+                        label_merges.append({"merged_topic_id": t.topic_id,
+                                             "into_topic_id": into.topic_id,
+                                             "reason": "identical_llm_label",
+                                             "label": t.label, "brand": t.brand,
+                                             "merged_size": t.size, "into_size": into.size})
+            if remap:
+                assigned = merge_topics_into(topics, assigned, remap)
+                member_texts, _n_resid = build_evidence(assigned, which=set(remap.values()))
+                build_keywords(member_texts)
+                merge_log.extend(label_merges)
+            print(f"Label merge: {len(remap)} same-brand topics merged into an identically "
+                  f"labelled neighbour (centroid >= {args.label_merge_similarity})")
+        llm_info["label_merges"] = len(label_merges)
+
+    if merge_log:
+        _p = out_dir / "duplicate_topic_merges.csv"
+        _lm = pd.DataFrame(merge_log)
+        if _p.exists():
+            _lm = pd.concat([pd.read_csv(_p).assign(reason="centroid_similarity"), _lm],
+                            ignore_index=True)
+        _lm.to_csv(_p, index=False)
+
+    # Cross-brand redundancy: the same name across brands is one theme.
+    _lab_counts = pd.Series([t.label for t in topics]).value_counts().to_dict()
+    for t in topics:
+        t.label_group_size = int(_lab_counts.get(t.label, 1))
+    if args.label_method == "llm":
+        _rows = []
+        for lab, n in _lab_counts.items():
+            if n < 2:
+                continue
+            grp = [t for t in topics if t.label == lab]
+            _rows.append({"label": lab, "topics": n,
+                          "brands": len({t.brand for t in grp}),
+                          "brand_list": " | ".join(sorted({t.brand for t in grp})),
+                          "total_size": int(sum(t.size or 0 for t in grp)),
+                          "topic_ids": " ".join(t.topic_id for t in grp)})
+        if _rows:
+            pd.DataFrame(_rows).sort_values("total_size", ascending=False) \
+              .to_csv(out_dir / "label_groups.csv", index=False)
 
     # Junk flags. Any one signal firing is enough; they fail differently.
     for t in topics:
-        term_ratio, empty_ratio = junk_signals(t.label, member_texts.get(t.topic_id, []), content_stop)
+        term_ratio, empty_ratio = junk_signals(" / ".join(t.keywords) if t.keywords else t.label,
+                                               member_texts.get(t.topic_id, []), content_stop)
         reasons = []
         # A demonstrably coherent topic should not be demoted merely for
         # containing polite words: "flight / airline / thanks / great / thank"
@@ -3147,6 +3776,24 @@ def run(args: argparse.Namespace) -> int:
     n_junk = sum(1 for t in topics if t.is_junk)
     print(f"\nLayer 3: {n_junk:,} of {len(topics):,} topics carry no reputation signal "
           f"({'demoted from ranking' if args.flag_junk_topics else 'flagged only, ranking unchanged'}).")
+
+    # One-directional suppression (P1): any negative signal suppresses;
+    # llm_substantive = True rescues nothing.
+    for t in topics:
+        why = []
+        if t.is_junk:
+            why.append("is_junk")
+        if t.residual_cluster:
+            why.append("residual_cluster")
+        if t.llm_substantive is False:
+            why.append("llm_not_substantive")
+        if t.campaign_cluster:
+            why.append("campaign_cluster")
+        t.suppressed = bool(why)
+        t.suppress_reason = ";".join(why) if why else None
+    print(f"Suppressed (junk | residual | !llm_substantive | campaign): "
+          f"{sum(1 for t in topics if t.suppressed)} of {len(topics)}; "
+          f"campaign clusters: {sum(1 for t in topics if t.campaign_cluster)}")
 
     # P5. last_seen_at from every assignment, not just the discovery pass.
     # Discovery only sees the history window, so a topic that kept receiving
@@ -3188,18 +3835,48 @@ def run(args: argparse.Namespace) -> int:
         if _dormant:
             print(f"Idle this window (no records assigned): {_dormant} of {len(topics)} topics")
 
-    # P2. Identify conversational grab-bags before anything ranks them.
-    _members = {}
-    for tid, grp in _assigned_any.groupby("topic_id"):
-        _members[tid] = grp["clean_text"].astype(str).tolist()
-    _n_resid = flag_residual_clusters(topics, _members, args.residual_ack_ratio)
-    print(f"Residual (chatter) clusters flagged: {_n_resid} of {len(topics)}")
+    retired_idle: List[str] = []
+    if args.retire_idle:
+        # A topic with no records anywhere in the window (~a month under a
+        # 3-chunk window) is not dormant, it is over. Only 6 of 805 topics were
+        # DORMANT in out_w300_6 because carry-forward never let anything go.
+        # Idle means the topic got nothing while its brand was talking. A brand
+        # that is silent for the whole window (McDonalds and MicrosoftHelps are
+        # absent from this stream until 1 Dec) keeps its registry, or it comes
+        # back to find no topics at all.
+        _active_brands = set(segments["brand"].astype(str))
+        retired_idle = [t.topic_id for t in topics
+                        if not t.size and (t.brand in _active_brands
+                                           or t.brand in ("__SMALL_BRANDS__", "GLOBAL"))]
+        if retired_idle:
+            _gone = set(retired_idle)
+            topics[:] = [t for t in topics if t.topic_id not in _gone]
+            pd.DataFrame({"topic_id": retired_idle, "decision": "RETIRED_IDLE"}) \
+              .to_csv(out_dir / "retired_topics.csv", index=False)
+        print(f"Retired {len(retired_idle)} topics with no records in the window")
+
+    # P0 write-time guarantee. Should be a no-op now that the ID counter clears
+    # the registry; if anything still re-emits an ID, keep the entry whose
+    # brand matches its members and say so loudly.
+    topics, _dupes_written = dedupe_topic_ids(topics, assigned)
+    if _dupes_written:
+        print(f"WARNING: {_dupes_written} duplicate topic_id entries collapsed at write time",
+              file=sys.stderr)
+    assert len(topics) == len({t.topic_id for t in topics}), "topic_id must be unique"
+
+    # Time-series counts: one record can contribute to multiple topics, but only once per topic/day.
+    counts = unique_record_topic_counts(assigned)
+    ts = build_complete_timeseries(counts, topics)
+    hot = add_hot_scores(ts)
 
     topic_meta = pd.DataFrame([
         {
             "topic_id": t.topic_id,
             "brand": t.brand,
             "label": t.label,
+            "description": t.description,
+            "keywords": " / ".join(t.keywords) if t.keywords else None,
+            "llm_substantive": t.llm_substantive,
             "size": t.size,
             "status": t.status,
             "created_at": t.created_at,
@@ -3211,6 +3888,14 @@ def run(args: argparse.Namespace) -> int:
             "residual_cluster": bool(t.residual_cluster),
             "residual_reason": t.residual_reason,
             "ack_member_ratio": t.ack_member_ratio,
+            "label_source": t.label_source,
+            "llm_confidence": t.llm_confidence,
+            "llm_proposed_label": t.llm_proposed_label,
+            "near_duplicate_ratio": t.near_duplicate_ratio,
+            "campaign_cluster": bool(t.campaign_cluster),
+            "label_group_size": t.label_group_size,
+            "suppressed": bool(t.suppressed),
+            "suppress_reason": t.suppress_reason,
         }
         for t in topics
     ])
@@ -3224,8 +3909,8 @@ def run(args: argparse.Namespace) -> int:
     # Demotion sorts junk to the bottom rather than dropping it, so the rows
     # stay auditable and a bad threshold costs nothing to undo.
     if args.flag_junk_topics:
-        summary = summary.sort_values(["is_junk", "hot_score", "recent_volume"],
-                                      ascending=[True, False, False])
+        summary = summary.sort_values(["suppressed", "is_junk", "hot_score", "recent_volume"],
+                                      ascending=[True, True, False, False])
     else:
         summary = summary.sort_values(["hot_score", "recent_volume"], ascending=False)
 
@@ -3279,13 +3964,20 @@ def run(args: argparse.Namespace) -> int:
 
     # Carry momentum onto the topic objects so topics.json records not just where
     # a topic sits but how it was behaving -- --previous-topics reads this back.
-    if not hot.empty:
-        hot_lookup = hot.set_index("topic_id")[["hot_score", "status"]].to_dict("index")
+    # The status written here is the GATED one. It used to be read from the
+    # ungated HotScore frame, so topics.json showed HOT/TRENDING on topics the
+    # alert gate had already demoted -- 8-35 negative-coherence "alerts" per
+    # batch that the summary CSV had in fact suppressed.
+    if not summary.empty and "hot_score" in summary.columns:
+        hot_lookup = summary.set_index("topic_id")[
+            ["hot_score", "status", "alert_suppressed_reason"]].to_dict("index")
         for t in topics:
             h = hot_lookup.get(t.topic_id)
             if h is not None:
                 t.hot_score = None if pd.isna(h["hot_score"]) else round(float(h["hot_score"]), 6)
                 t.hot_status = None if pd.isna(h["status"]) else str(h["status"])
+                r = h.get("alert_suppressed_reason")
+                t.alert_suppressed_reason = None if r is None or pd.isna(r) else str(r)
 
     if args.event_recall:
         _er = compute_event_recall(assigned, topics)
@@ -3349,6 +4041,43 @@ def run(args: argparse.Namespace) -> int:
         "umap_drift": (None if umap_projector is None or umap_projector.drift_frame().empty
                        else round(float(umap_projector.drift_frame()["mean_dist_to_reference"].mean()), 5)),
         "previous_topics": args.previous_topics,
+        "window": {
+            "mode": "sliding" if history_files else "single-chunk",
+            "history_csvs": history_files,
+            "holdout_csv": args.csv,
+            "start": None if df.empty else pd.Timestamp(df["event_time"].min()).isoformat(),
+            "end": None if pd.isna(window_end) else window_end.isoformat(),
+            "holdout_records": len(main_record_ids),
+            "size_semantics": "distinct records assigned within this window; "
+                              f"up to {args.max_topics_per_segment} topics per segment",
+        },
+        "registry_integrity": {
+            "previous_duplicate_ids_dropped": int(_prev_dupes),
+            "written_duplicate_ids_collapsed": int(_dupes_written),
+            "unique_topic_ids": len({t.topic_id for t in topics}),
+            "id_floor_previous": int(topic_id_floor(previous_topics)),
+            **{f"previous_{k}": int(v) for k, v in lifecycle_fix.items()},
+            "last_seen_beyond_window": int(sum(
+                1 for t in topics
+                if not pd.isna(pd.to_datetime(t.last_seen_at, errors="coerce", utc=True))
+                and pd.to_datetime(t.last_seen_at, utc=True) > window_end)),
+        },
+        "llm": llm_info,
+        "consolidation": {
+            "max_live_topics": int(args.max_live_topics),
+            "min_similarity": float(args.consolidate_min_similarity),
+            "capacity_merges": sum(1 for m in merge_log if m.get("reason") == "capacity"),
+            "label_merges": sum(1 for m in merge_log if m.get("reason") == "identical_llm_label"),
+            "retired_idle": len(retired_idle),
+            "recover_match_existing": bool(args.recover_match_existing),
+            "secondary_margin": float(args.secondary_margin),
+        },
+        "quality_gate": {
+            "suppressed": int(sum(1 for t in topics if t.suppressed)),
+            "campaign_clusters": int(sum(1 for t in topics if t.campaign_cluster)),
+            "alerts": int(summary["status"].isin(["HOT", "TRENDING"]).sum()),
+            "alerts_suppressed": int(summary["alert_suppressed"].sum()),
+        },
         "segments": int(len(segments)),
         "records": int(segments["record_id"].nunique()),
         "topics": len(topics),
@@ -3367,6 +4096,7 @@ def run(args: argparse.Namespace) -> int:
         plot_hot_topics(ts, topics, out_dir)
 
     timer.mark("metrics + outputs", f"{len(topics):,} topics scored")
+    save_json(out_dir / "stage_timing.json", timer.as_dict())
 
     print("\nTop detected topics:")
     cols = ["topic_id", "label", "size", "recent_volume", "growth_rate", "velocity_ratio", "hot_score", "status", "status_lifecycle"]
