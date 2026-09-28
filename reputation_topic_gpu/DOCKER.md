@@ -98,30 +98,67 @@ docker run --rm -v "$PWD/out":/out reputation-topic-gpu /app/event_recall.py ...
 docker run --rm -it --entrypoint bash reputation-topic-gpu       # poke around
 ```
 
-### docker compose
+### docker compose: 200k base, then the 300k stream
+
+`docker-compose.yml` defines the two-step run as services:
+
+| Service | Runs | Writes |
+|---|---|---|
+| `base` | `reputation_topic_detection.py` on `twcs_subset_200k.csv`, LLM labels, fresh per-brand UMAP fit | `$OUT_DIR/base_200k/`, `$OUT_DIR/models/umap_v5_perbrand.*` |
+| `stream` | `run_stream.py` over `stream300/chunk_1..6.csv`, 3-chunk sliding window, matched against `base_200k` | `$OUT_DIR/stream_1..6/`, `stream_summary.csv`, `stage_timing.csv` |
+| `topics` | ad-hoc (`--help` by default) | — |
 
 ```bash
-DATA_DIR=/path/to/data docker compose up --build
-CUDA_EXTRA=cu126 DATA_DIR=/path/to/data docker compose up --build   # older driver
+# once, on the GPU box
+cp .env.example .env              # fill in api_key= (AI Router v1)
+mkdir -p out_docker               # must exist and be writable by uid 1000
+export DATA_DIR=/path/to/data     # holds twcs_subset_200k.csv and stream300/chunk_{1..6}.csv
+export CUDA_EXTRA=cu130           # cu126 for a driver older than 580
+docker compose build
+docker compose run --rm topics /app/gpu_check.py
+
+# the run
+docker compose run --rm base      # step 1: 200k base registry
+docker compose run --rm stream    # step 2: 300k stream against it
 ```
 
-The service reserves an NVIDIA device, so compose will refuse to start on a
-machine without one — for a CPU-only sanity run, use plain `docker run` with a
-`CUDA_EXTRA=cpu` image instead of compose.
+Knobs, exported in the shell or set in `.env`: `MAX_VRAM_GB` (default `2`),
+`GPU_ID` (default `0`), `DATA_DIR` (default `../data`), `OUT_DIR` (default
+`./out_docker`), `CUDA_EXTRA`.
 
-Override the command for a different run:
+Things that matter:
 
-```bash
-docker compose run --rm topics /app/reputation_topic_detection.py \
-  /data/twcs_subset_150k.csv --out /out/run2 --embed-cache /cache/embed
-```
+- **VRAM is capped in code, not by Docker.** Docker hands a container whole
+  GPUs and has no memory limit for them; `--max-vram-gb` (below) is what holds
+  the process at 2 GiB. Check the `VRAM cap recalibrated after warm-up ... (NVML)`
+  line in the log and `peak_process_vram_mib` in `run_metadata.json`.
+- **Run `base` before `stream`.** `stream` reads `base_200k/topics.json` and the
+  UMAP model `base` fitted. There is deliberately no `depends_on`: `compose run
+  stream` would otherwise re-run the base every time.
+- **The two buffers stay separate.** The base's leftover records run to 30 Nov;
+  sharing its buffer would feed them into stream batch 1 (1-14 Oct).
+- **The embedding cache volume starts empty and must stay on.** With
+  `--window 3` every chunk sits in three windows; the per-chunk cache is what
+  makes each one embedded once. `docker volume rm reputation_topic_gpu_topic-cache`
+  forces a clean re-embed.
+- **Offline model.** The multilingual model is baked into the image and
+  `HF_HUB_OFFLINE=1` is set, so no run needs Hugging Face access. The AI
+  Router does need network access for `--label-method llm`.
+- Compose reserves an NVIDIA device, so it refuses to start on a machine
+  without one. For a CPU-only sanity run use plain `docker run` with a
+  `CUDA_EXTRA=cpu` image and `--device cpu`.
 
 ## Tuning the GPU pass
 
-- `--max-vram-gb` (default 2) is a hard ceiling, not a hint. The CUDA context
-  is measured and subtracted from it, and the caching allocator is capped at
-  what is left, so the process cannot exceed the number you give even if the
-  batch estimate is wrong. `run_metadata.json` records the peak actually used.
+- `--max-vram-gb` (default 2) caps the **whole process** -- the number
+  `nvidia-smi` shows, not just torch's allocator. After the model loads, a
+  warm-up encode pulls in every kernel and cuBLAS/cuDNN workspace; that
+  overhead is then measured (per process, through NVML) and the caching
+  allocator is capped at cap - overhead - 96 MiB. While embedding, the process
+  footprint is re-checked every 5k texts and the batch halves if it is ever
+  over. `run_metadata.json` records `peak_process_vram_mib` (what nvidia-smi
+  saw), `vram_overhead_mib` and the allocator peak. Without `nvidia-ml-py`
+  the overhead falls back to a device-wide estimate, which errs smaller.
   On a card you have to yourself, raise it — the budget is what sets the batch
   size, so a bigger budget is a bigger batch is a faster pass.
 - `--batch-size` is no longer a guess you have to tune. Leave it off and the
@@ -142,16 +179,15 @@ docker compose run --rm topics /app/reputation_topic_detection.py \
 
 ## LLM topic labelling
 
-`--label-method llm` calls the QuestionPro AI Router and needs credentials.
-Pass them as environment variables, never baked into the image:
+`--label-method llm` calls the QuestionPro AI Router and needs credentials,
+passed at run time and never baked into the image. The default backend is AI
+Router v1 (`airouter_v1_client.py`, prompt sent inline), which reads `api_key`,
+`base_url` and `use_case` -- the keys in `.env.example`. Compose passes `.env`
+to every service; with plain docker use `--env-file .env`.
 
-```bash
-docker run --rm --gpus all --env-file air2.env ... 
-```
-
-with `air2.env` holding `AIR2_QP_OAUTH_HOST`, `AIR2_S2S_CLIENT_ID`,
-`AIR2_S2S_CLIENT_SECRET`, `AIR2_CONSUMER_ID`, `AIR2_USER_ID`. Compose already
-forwards these from the host environment.
+The AiRouterV2 backend (`--label-llm-backend air2`) reads `AIR2_QP_OAUTH_HOST`,
+`AIR2_S2S_CLIENT_ID`, `AIR2_S2S_CLIENT_SECRET`, `AIR2_CONSUMER_ID` and
+`AIR2_USER_ID` from the same file.
 
 ## Optional: cuML for GPU clustering
 

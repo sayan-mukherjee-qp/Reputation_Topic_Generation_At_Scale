@@ -60,8 +60,10 @@ COPY *.py README.md DOCKER.md ./
 
 USER app
 
-# Bake the default embedding model in so a run needs no network access.
-ARG EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+# Bake the embedding model in so a run needs no network access. This is the
+# multilingual model every run in this repo uses (docker-compose.yml passes it
+# too); the corpus mixes English, Spanish, French, German and Japanese.
+ARG EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 RUN python -c "\
 from sentence_transformers import SentenceTransformer; \
 SentenceTransformer('${EMBEDDING_MODEL}', device='cpu')"
