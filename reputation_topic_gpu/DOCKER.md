@@ -21,21 +21,26 @@ a big GPU.
 
 ## Choosing the CUDA build
 
-The torch wheels carry their own CUDA runtime, so the image needs no
-`nvidia/cuda` base — only the host driver via the NVIDIA Container Toolkit.
-Match the build to the driver on the box (`nvidia-smi` shows it):
+The image is built on an `nvidia/cuda` base (Ubuntu 24.04, system Python
+3.12); the host driver comes in through the NVIDIA Container Toolkit. The
+default `-base-` flavour is enough because the torch wheels bring their own
+cuBLAS/cuDNN — pass a `-runtime-` or `-devel-` tag as `CUDA_BASE` if you want
+the full toolkit in the container. Match the build to the driver on the box
+(`nvidia-smi` shows it) and keep the two args paired:
 
-| Build arg | torch | Requires host driver |
-| --- | --- | --- |
-| `CUDA_EXTRA=cu130` *(default)* | 2.14.0+cu130 | >= 580 |
-| `CUDA_EXTRA=cu126` | 2.14.0+cu126 | >= 560 |
-| `CUDA_EXTRA=cpu` | 2.14.0+cpu | — (local sanity run) |
+| `CUDA_EXTRA` | `CUDA_BASE` | torch | Requires host driver |
+| --- | --- | --- | --- |
+| `cu130` *(default)* | `nvidia/cuda:13.0.1-base-ubuntu24.04` | 2.14.0+cu130 | >= 580 |
+| `cu126` | `nvidia/cuda:12.6.3-base-ubuntu24.04` | 2.14.0+cu126 | >= 560 |
+| `cpu` | `ubuntu:24.04` | 2.14.0+cpu | — (local sanity run) |
 
 ## Build
 
 ```bash
 docker build -t reputation-topic-gpu .                      # cu130
-docker build --build-arg CUDA_EXTRA=cu126 -t reputation-topic-gpu:cu126 .
+docker build --build-arg CUDA_EXTRA=cu126 \
+  --build-arg CUDA_BASE=nvidia/cuda:12.6.3-base-ubuntu24.04 \
+  -t reputation-topic-gpu:cu126 .
 ```
 
 The CUDA build pulls roughly 5 GB of wheels, so the first one is slow. uv's
