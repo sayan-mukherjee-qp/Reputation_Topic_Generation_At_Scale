@@ -58,7 +58,6 @@ COMMON = [
     # --secondary-margin 0.05 cut inflation 1.82x -> 1.35x but cost event
     # recall 0.508 -> 0.431 in a same-input batch-6 ablation; left off.
     "--secondary-margin", "0",
-    "--embed-cache", str(CACHE),
 ]
 
 
@@ -176,6 +175,15 @@ def main() -> int:
     ap.add_argument("--label-method", default="llm", choices=["ctfidf", "llm"])
     ap.add_argument("--label-llm-samples", default="10")
     ap.add_argument("--label-llm-workers", default="12")
+    # GPU / embedding, passed straight to every batch.
+    ap.add_argument("--device", default=None, help="cuda, cuda:1, cpu (default: auto)")
+    ap.add_argument("--fp16", action="store_true")
+    ap.add_argument("--max-vram-gb", default=None)
+    ap.add_argument("--batch-size", default=None)
+    ap.add_argument("--embed-cache", default=str(CACHE),
+                    help="Per-chunk embedding cache. Keep it on with --window > 1: it is what "
+                         "stops each chunk being re-embedded once per window it appears in. "
+                         "'' disables it")
     a = ap.parse_args()
 
     Path(a.out_prefix).parent.mkdir(parents=True, exist_ok=True)
@@ -197,6 +205,16 @@ def main() -> int:
                "--label-llm-workers", a.label_llm_workers]
         if history:
             cmd += ["--history-csv", *history]
+        if a.embed_cache:
+            cmd += ["--embed-cache", a.embed_cache]
+        if a.device:
+            cmd += ["--device", a.device]
+        if a.fp16:
+            cmd += ["--fp16"]
+        if a.max_vram_gb:
+            cmd += ["--max-vram-gb", str(a.max_vram_gb)]
+        if a.batch_size:
+            cmd += ["--batch-size", str(a.batch_size)]
         print(f"=== chunk {i}: {Path(chunk).name} -> {out.name} ===", flush=True)
         t0 = time.perf_counter()
         r = subprocess.run(cmd, capture_output=True, text=True)
