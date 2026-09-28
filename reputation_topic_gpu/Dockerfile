@@ -2,19 +2,19 @@
 #
 # GPU image for the reputation topic pipeline.
 #
-# Built on an nvidia/cuda base (Ubuntu 24.04, whose system Python is 3.12).
-# The torch wheels still bring their own cuBLAS/cuDNN, so the lean `base`
-# flavour is enough; swap in `-runtime-` or `-devel-` if you need the full
-# toolkit inside the container. The host driver is exposed by the NVIDIA
-# Container Toolkit (`--gpus all`).
+# Built on the nvidia/cuda devel image (full CUDA toolkit, nvcc included) on
+# Ubuntu 24.04, whose system Python is 3.12. Ubuntu 22.04 tags will not work:
+# they ship Python 3.10 and the project needs 3.12. The host driver is exposed
+# by the NVIDIA Container Toolkit (`--gpus all`) and must support the base
+# image's CUDA version -- the container refuses to start otherwise.
 #
 # Pick the CUDA build to match the host driver, and keep the two args paired:
-#   CUDA_EXTRA=cu130 CUDA_BASE=nvidia/cuda:13.0.1-base-ubuntu24.04  (default) driver >= 580
-#   CUDA_EXTRA=cu126 CUDA_BASE=nvidia/cuda:12.6.3-base-ubuntu24.04            driver >= 560
-#   CUDA_EXTRA=cpu   CUDA_BASE=ubuntu:24.04                                   no GPU, sanity run
+#   CUDA_EXTRA=cu130 CUDA_BASE=nvidia/cuda:13.4.1-devel-ubuntu24.04  (default)
+#   CUDA_EXTRA=cu126 CUDA_BASE=nvidia/cuda:12.6.3-devel-ubuntu24.04  driver >= 560
+#   CUDA_EXTRA=cpu   CUDA_BASE=ubuntu:24.04                           no GPU, sanity run
 
 ARG CUDA_EXTRA=cu130
-ARG CUDA_BASE=nvidia/cuda:13.0.1-base-ubuntu24.04
+ARG CUDA_BASE=nvidia/cuda:13.4.1-devel-ubuntu24.04
 
 FROM ghcr.io/astral-sh/uv:0.8 AS uv
 
@@ -78,6 +78,8 @@ USER app
 # multilingual model every run in this repo uses (docker-compose.yml passes it
 # too); the corpus mixes English, Spanish, French, German and Japanese.
 ARG EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+# Kept as ENV so gpu_check.py loads the model that is actually baked in.
+ENV EMBEDDING_MODEL=${EMBEDDING_MODEL}
 RUN python -c "\
 from sentence_transformers import SentenceTransformer; \
 SentenceTransformer('${EMBEDDING_MODEL}', device='cpu')"

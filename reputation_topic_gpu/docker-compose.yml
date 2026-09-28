@@ -9,7 +9,7 @@
 # Settings, exported in the shell or set in .env beside this file:
 #   CUDA_EXTRA   cu130 (driver >= 580) | cu126 (driver >= 560) | cpu
 #   CUDA_BASE    base image paired with CUDA_EXTRA (default
-#                nvidia/cuda:13.0.1-base-ubuntu24.04; see the Dockerfile header)
+#                nvidia/cuda:13.4.1-devel-ubuntu24.04; see the Dockerfile header)
 #   GPU_ID       which GPU to use (default 0)
 #   MAX_VRAM_GB  whole-process VRAM cap, what nvidia-smi shows (default 2)
 #   DATA_DIR     host dir holding twcs_subset_200k.csv and stream300/chunk_*.csv
@@ -23,7 +23,7 @@ x-topics: &topics
     context: .
     args:
       CUDA_EXTRA: ${CUDA_EXTRA:-cu130}
-      CUDA_BASE: ${CUDA_BASE:-nvidia/cuda:13.0.1-base-ubuntu24.04}
+      CUDA_BASE: ${CUDA_BASE:-nvidia/cuda:13.4.1-devel-ubuntu24.04}
       EMBEDDING_MODEL: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
   image: reputation-topic-gpu:${CUDA_EXTRA:-cu130}
   volumes:

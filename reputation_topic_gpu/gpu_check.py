@@ -4,6 +4,7 @@ Run before a long job: `docker run --rm --gpus all reputation-topic-gpu /app/gpu
 """
 from __future__ import annotations
 
+import os
 import sys
 
 
@@ -36,9 +37,11 @@ def main() -> int:
 
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cuda")
+    # The image bakes one model in and runs offline; EMBEDDING_MODEL names it.
+    name = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    model = SentenceTransformer(name, device="cuda")
     emb = model.encode(["gpu smoke test"], normalize_embeddings=True)
-    print(f"sentence-transformers OK (dim={emb.shape[-1]}, model cached locally)")
+    print(f"sentence-transformers OK ({name}, dim={emb.shape[-1]})")
     return 0
 
 
