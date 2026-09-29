@@ -12,6 +12,7 @@ Two files in this directory are **not tracked in git**. Both exceed GitHub's
 | `twcs_subset_200k.csv` | 214,340 | 31 MB | tracked |
 | `stream/stream_200k.csv` | 218,732 | 32 MB | tracked |
 | `stream/chunk_1..4.csv` | ~54k each | 7-9 MB | tracked |
+| `stream300/chunk_1..6.csv` | ~49.4k each (296,313 total) | 7-9 MB | tracked — the 300k stream `docker compose run stream` replays |
 
 The tracked subsets are what the pipeline is normally run against, so a fresh
 clone can run everything without rebuilding anything.
