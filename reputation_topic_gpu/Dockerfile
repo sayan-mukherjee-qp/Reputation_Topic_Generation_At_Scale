@@ -70,7 +70,10 @@ RUN userdel --remove ubuntu 2>/dev/null || true \
 
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
-COPY *.py README.md DOCKER.md ./
+# --chmod: the container runs as uid 1000 while COPY keeps the host's mode
+# bits under root ownership, so a checkout with 600/640 files ("Permission
+# denied" on /app/gpu_check.py) would otherwise be unreadable to it.
+COPY --chmod=0644 *.py README.md DOCKER.md ./
 
 USER app
 

@@ -49,7 +49,7 @@ uv sync --extra cu130      # or --extra cu126 for a driver older than 580, or --
 source .venv/bin/activate
 ```
 
-The default embedding model is `sentence-transformers/all-MiniLM-L6-v2`. The Docker image bakes it in; a local run downloads it on first use.
+The pipeline's default embedding model is `sentence-transformers/all-MiniLM-L6-v2`; a local run downloads it on first use. The Docker image instead bakes in `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (the corpus is multilingual) and runs offline, so pass `--model` with that name inside the container, as `docker-compose.yml` does.
 
 ## Run
 

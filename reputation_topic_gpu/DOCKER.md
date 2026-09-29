@@ -21,17 +21,16 @@ a big GPU.
 
 ## Choosing the CUDA build
 
-The image is built on an `nvidia/cuda` base (Ubuntu 24.04, system Python
-3.12); the host driver comes in through the NVIDIA Container Toolkit. The
-default `-base-` flavour is enough because the torch wheels bring their own
-cuBLAS/cuDNN — pass a `-runtime-` or `-devel-` tag as `CUDA_BASE` if you want
-the full toolkit in the container. Match the build to the driver on the box
-(`nvidia-smi` shows it) and keep the two args paired:
+The image is built on `nvidia/cuda:13.4.1-devel-ubuntu24.04` (full CUDA
+toolkit, system Python 3.12); the host driver comes in through the NVIDIA
+Container Toolkit and must support the base image's CUDA version. Ubuntu 22.04
+tags will not work — they ship Python 3.10. Match the build to the driver on
+the box (`nvidia-smi` shows it) and keep the two args paired:
 
 | `CUDA_EXTRA` | `CUDA_BASE` | torch | Requires host driver |
 | --- | --- | --- | --- |
-| `cu130` *(default)* | `nvidia/cuda:13.0.1-base-ubuntu24.04` | 2.14.0+cu130 | >= 580 |
-| `cu126` | `nvidia/cuda:12.6.3-base-ubuntu24.04` | 2.14.0+cu126 | >= 560 |
+| `cu130` *(default)* | `nvidia/cuda:13.4.1-devel-ubuntu24.04` | 2.14.0+cu130 | supports CUDA 13.4 |
+| `cu126` | `nvidia/cuda:12.6.3-devel-ubuntu24.04` | 2.14.0+cu126 | >= 560 |
 | `cpu` | `ubuntu:24.04` | 2.14.0+cpu | — (local sanity run) |
 
 ## Build
@@ -39,7 +38,7 @@ the full toolkit in the container. Match the build to the driver on the box
 ```bash
 docker build -t reputation-topic-gpu .                      # cu130
 docker build --build-arg CUDA_EXTRA=cu126 \
-  --build-arg CUDA_BASE=nvidia/cuda:12.6.3-base-ubuntu24.04 \
+  --build-arg CUDA_BASE=nvidia/cuda:12.6.3-devel-ubuntu24.04 \
   -t reputation-topic-gpu:cu126 .
 ```
 
