@@ -14,6 +14,7 @@
 #   MAX_VRAM_GB  whole-process VRAM cap, what nvidia-smi shows (default 2)
 #   DATA_DIR     host dir holding twcs_subset_200k.csv and stream300/chunk_*.csv
 #   OUT_DIR      host dir for every output, the UMAP model and buffers
+#   CACHE_DIR    host dir for the embedding cache (default: the topic-cache volume)
 #
 # The same .env supplies the AI Router credentials (api_key=, base_url=,
 # use_case=) to the container at run time; it is never baked into the image.
@@ -31,7 +32,9 @@ x-topics: &topics
     - ${OUT_DIR:-./out_docker}:/out
     # Per-chunk embedding cache. It starts empty; within the stream it is what
     # stops each chunk being re-embedded once per window it appears in.
-    - topic-cache:/cache
+    # A named volume on Docker's own disk by default; set CACHE_DIR to a host
+    # path (e.g. /data/reputation_cache) when that disk is short on space.
+    - ${CACHE_DIR:-topic-cache}:/cache
   env_file:
     - path: .env
       required: false
