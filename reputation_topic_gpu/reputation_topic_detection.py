@@ -80,6 +80,9 @@ VRAM_CAP_HEADROOM = 96 * 1024 ** 2
 # the cap. Only read when CUDA first initialises, and never overrides a value
 # the operator set.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# NVML numbers GPUs by PCI bus; CUDA by default puts the fastest first. The
+# VRAM cap reads NVML for the device torch is using, so make them agree.
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 # Acknowledgement anchors for Layer 1. Only English is listed on purpose: the
 # multilingual encoder places "thanks", "gracias" and "ありがとう" in the same
@@ -773,6 +776,10 @@ def apply_vram_cap(device: str, limit_gb: float) -> Optional[int]:
     """
     if not str(device).startswith("cuda") or limit_gb <= 0:
         return None
+    # Before torch touches the card: what everyone ELSE is already using.
+    # NVML reads it without creating a CUDA context of our own.
+    _nvml_idx = int(device.split(":")[1]) if ":" in device else 0
+    _GPU_BASELINE[_nvml_idx] = _nvml_device_used(_nvml_idx)
     import torch
     idx = _cuda_index(device)
     total = torch.cuda.get_device_properties(idx).total_memory
@@ -786,6 +793,9 @@ def apply_vram_cap(device: str, limit_gb: float) -> Optional[int]:
     # That errs towards a smaller budget, which is the safe direction; the
     # clamp stops a busy card from driving the budget to nothing.
     measured = total - free - torch.cuda.memory_reserved(idx)
+    _others = _GPU_BASELINE.get(_nvml_idx)
+    if _others is not None:
+        measured -= _others          # other processes' memory is not our context
     context = int(min(max(measured, CUDA_CONTEXT_MIN), CUDA_CONTEXT_MAX))
 
     budget = int(limit_gb * 1024 ** 3) - context
@@ -795,18 +805,42 @@ def apply_vram_cap(device: str, limit_gb: float) -> Optional[int]:
             f"{context / 1024 ** 2:.0f} MiB CUDA context. Raise the cap, or use --device cpu.")
 
     torch.cuda.set_per_process_memory_fraction(min(budget / total, 1.0), idx)
-    print(f"VRAM cap: {limit_gb:.2f} GiB "
+    print(f"VRAM cap: {limit_gb:.2f} GiB, provisional "
           f"({context / 1024 ** 2:.0f} MiB CUDA context + "
-          f"{budget / 1024 ** 2:.0f} MiB allocator budget)")
+          f"{budget / 1024 ** 2:.0f} MiB allocator budget; re-measured after model warm-up)"
+          + (f"; other processes already hold {_others / 1024 ** 2:.0f} MiB on this GPU"
+             if _others else ""))
     return budget
 
 
-def _process_vram_bytes(idx: int) -> Optional[int]:
-    """This process's GPU memory as nvidia-smi reports it, via NVML.
+# Device memory other processes held before this one initialised CUDA, per
+# NVML device index. Filled by apply_vram_cap.
+_GPU_BASELINE: Dict[int, Optional[int]] = {}
+
+
+def _nvml_device_used(idx: int) -> Optional[int]:
+    """Device-wide used memory from NVML, or None without NVML."""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        return int(pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(idx)).used)
+    except Exception:
+        return None
+
+
+def _process_vram_bytes(idx: int) -> Tuple[Optional[int], str]:
+    """This process's GPU memory as nvidia-smi reports it, and how it was measured.
 
     That is the number an operator watches, and it includes the CUDA context
-    and library workspaces that torch.cuda's own counters never see. None when
-    NVML is unavailable.
+    and library workspaces that torch.cuda's own counters never see.
+
+    1. NVML's per-process entry for our PID. Works on a host, but NOT in a
+       container: NVML reports host PIDs while os.getpid() is the container's,
+       so they never match.
+    2. Device-wide use now minus what other processes held before we started
+       (the baseline). Correct in a container; if a neighbour grows during the
+       run it is counted as ours, which errs towards a smaller batch.
+    Returns (None, reason) when neither is available.
     """
     try:
         import pynvml
@@ -821,11 +855,15 @@ def _process_vram_bytes(idx: int) -> Optional[int]:
                 continue
             for proc in f(h):
                 if proc.pid == pid and proc.usedGpuMemory is not None:
-                    return int(proc.usedGpuMemory)
-            return None
+                    return int(proc.usedGpuMemory), "NVML per-process"
+            break
     except Exception:
-        return None
-    return None
+        return None, "no NVML"
+    base = _GPU_BASELINE.get(idx)
+    used = _nvml_device_used(idx)
+    if base is not None and used is not None:
+        return max(0, used - base), "NVML device use minus pre-start baseline"
+    return None, "NVML without a baseline"
 
 
 class VramGuard:
@@ -855,7 +893,7 @@ class VramGuard:
 
     def process_bytes(self) -> int:
         """nvidia-smi's view when NVML is present, else allocator + measured overhead."""
-        v = _process_vram_bytes(self.idx)
+        v, _ = _process_vram_bytes(self.idx)
         if v is not None:
             return v
         return int(self.torch.cuda.memory_reserved(self.idx)) + self.overhead
@@ -870,28 +908,36 @@ class VramGuard:
         torch.cuda.synchronize(self.idx)
         torch.cuda.empty_cache()
         reserved = int(torch.cuda.memory_reserved(self.idx))
-        proc = _process_vram_bytes(self.idx)
+        proc, how = _process_vram_bytes(self.idx)
+        others = _GPU_BASELINE.get(self.idx)
         if proc is not None:
             overhead = proc - reserved
         else:
-            # Device-wide fallback. A neighbouring process inflates it, which
-            # errs towards a smaller budget -- the safe direction.
+            # Last resort: device-wide use from torch. It counts every other
+            # process on the card as ours, so it is only used without NVML.
             free, _ = torch.cuda.mem_get_info(self.idx)
             overhead = (self.total - free) - reserved
+            how = "device-wide estimate (no NVML: other processes counted as ours)"
+        measured = overhead
         self.overhead = int(min(max(overhead, CUDA_CONTEXT_MIN), 2 * CUDA_CONTEXT_MAX))
         self.budget = self.cap - self.overhead - VRAM_CAP_HEADROOM
         if self.budget < 256 * 1024 ** 2:
             raise RuntimeError(
                 f"--max-vram-gb {self.cap / 1024 ** 3:.2f} leaves only "
-                f"{self.budget / 1024 ** 2:.0f} MiB after {self.overhead / 1024 ** 2:.0f} MiB of "
-                f"CUDA context and library workspaces. Raise the cap, or use --device cpu.")
+                f"{self.budget / 1024 ** 2:.0f} MiB after {measured / 1024 ** 2:.0f} MiB measured "
+                f"as CUDA context and library workspaces ({how}"
+                + (f"; other processes held {others / 1024 ** 2:.0f} MiB at start" if others else "")
+                + "). If that is far above ~500-900 MiB, something else on the GPU is being "
+                  "counted: check nvidia-smi. Otherwise raise the cap, or use --device cpu.")
         torch.cuda.set_per_process_memory_fraction(min(self.budget / self.total, 1.0), self.idx)
         torch.cuda.reset_peak_memory_stats(self.idx)
         print(f"VRAM cap recalibrated after warm-up: {self.cap / 1024 ** 3:.2f} GiB = "
               f"{self.overhead / 1024 ** 2:.0f} MiB context/workspaces + "
               f"{VRAM_CAP_HEADROOM / 1024 ** 2:.0f} MiB headroom + "
               f"{self.budget / 1024 ** 2:.0f} MiB allocator "
-              f"({'NVML' if proc is not None else 'device-wide estimate'})")
+              f"({how}"
+              + (f"; other processes held {others / 1024 ** 2:.0f} MiB at start" if others else "")
+              + ")")
         return self.budget
 
     def over_cap(self) -> bool:
