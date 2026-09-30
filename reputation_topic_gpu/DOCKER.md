@@ -111,6 +111,7 @@ docker run --rm -it --entrypoint bash reputation-topic-gpu       # poke around
 | `base` | `reputation_topic_detection.py` on `twcs_subset_200k.csv`, LLM labels, fresh per-brand UMAP fit | `$OUT_DIR/base_200k/`, `$OUT_DIR/models/umap_v5_perbrand.*` |
 | `stream` | `run_stream.py` over `stream300/chunk_1..6.csv`, 3-chunk sliding window, matched against `base_200k` | `$OUT_DIR/stream_1..6/`, `stream_summary.csv`, `stage_timing.csv` |
 | `topics` | ad-hoc (`--help` by default) | — |
+| `dashboard` | web UI on `127.0.0.1:${DASHBOARD_PORT:-8765}`: a Start button that runs `base` then `stream`, live stage progress and timings, emerging topics and analytics ([dashboard/README.md](dashboard/README.md)) | `$OUT_DIR/dashboard_logs/` |
 
 ```bash
 # once, on the GPU box
@@ -124,6 +125,9 @@ docker compose run --rm topics /app/gpu_check.py
 # the run
 docker compose run --rm base      # step 1: 200k base registry
 docker compose run --rm stream    # step 2: 300k stream against it
+
+# ...or drive both from the web dashboard (ssh -L 8765:127.0.0.1:8765 to reach it)
+docker compose up dashboard
 ```
 
 Knobs, exported in the shell or set in `.env`: `MAX_VRAM_GB` (default `2`),

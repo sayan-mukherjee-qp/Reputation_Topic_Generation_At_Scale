@@ -53,6 +53,9 @@ The pipeline's default embedding model is `sentence-transformers/all-MiniLM-L6-v
 
 ## Run
 
+A web dashboard can start the 200k base run and the 300k stream, show each stage live, and chart
+the emerging topics and analytics. See [dashboard/README.md](dashboard/README.md).
+
 ```bash
 python reputation_topic_detection.py /path/to/twitter.csv \
   --out output \

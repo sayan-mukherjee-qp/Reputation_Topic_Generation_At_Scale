@@ -18,6 +18,15 @@ ARG CUDA_BASE=nvidia/cuda:13.4.1-devel-ubuntu24.04
 
 FROM ghcr.io/astral-sh/uv:0.8 AS uv
 
+# ------------------------------------------------------------------ web ---
+# The dashboard's React UI, built once to static files the backend serves.
+FROM node:22-slim AS web
+WORKDIR /web
+COPY dashboard/web/package.json dashboard/web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY dashboard/web/ ./
+RUN npm run build
+
 # ---------------------------------------------------------------- builder ---
 # Same base as the runtime, so the venv's python symlink resolves in both.
 FROM ${CUDA_BASE} AS builder
@@ -42,7 +51,7 @@ WORKDIR /app
 # Dependency layer on its own: it only rebuilds when the lockfile moves.
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --extra "${CUDA_EXTRA}"
+    uv sync --locked --no-dev --extra "${CUDA_EXTRA}" --extra dashboard
 
 # ---------------------------------------------------------------- runtime ---
 FROM ${CUDA_BASE} AS runtime
@@ -73,7 +82,9 @@ COPY --from=builder /app/.venv /app/.venv
 # --chmod: the container runs as uid 1000 while COPY keeps the host's mode
 # bits under root ownership, so a checkout with 600/640 files ("Permission
 # denied" on /app/gpu_check.py) would otherwise be unreadable to it.
-COPY --chmod=0644 *.py README.md DOCKER.md ./
+COPY --chmod=0644 *.py README.md DOCKER.md docker-compose.yml ./
+COPY --chmod=0644 dashboard/*.py ./dashboard/
+COPY --from=web --chmod=0755 /web/dist ./dashboard/web/dist
 
 USER app
 

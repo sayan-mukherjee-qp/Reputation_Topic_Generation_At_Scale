@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import pandas as pd
@@ -184,6 +186,8 @@ def main() -> int:
                     help="Per-chunk embedding cache. Keep it on with --window > 1: it is what "
                          "stops each chunk being re-embedded once per window it appears in. "
                          "'' disables it")
+    ap.add_argument("--echo", action="store_true",
+                    help="Also echo each batch's log to stdout as it runs, prefixed '  | '")
     a = ap.parse_args()
 
     Path(a.out_prefix).parent.mkdir(parents=True, exist_ok=True)
@@ -215,13 +219,27 @@ def main() -> int:
             cmd += ["--max-vram-gb", str(a.max_vram_gb)]
         if a.batch_size:
             cmd += ["--batch-size", str(a.batch_size)]
-        print(f"=== chunk {i}: {Path(chunk).name} -> {out.name} ===", flush=True)
-        t0 = time.perf_counter()
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        # The batch log is written as the run goes, not after it, so it can be
+        # followed live (tail -f, or the dashboard). Opened before the banner
+        # below, so a reader that keys off the banner never sees a stale log.
+        log_path = Path(a.out_prefix).parent / f"stream_chunk{i}.log"
+        tail: deque[str] = deque(maxlen=40)
+        with log_path.open("w", encoding="utf-8") as log:
+            print(f"=== chunk {i}: {Path(chunk).name} -> {out.name} ===", flush=True)
+            t0 = time.perf_counter()
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, errors="replace",
+                                    env={**os.environ, "PYTHONUNBUFFERED": "1"})
+            for line in proc.stdout:
+                log.write(line)
+                log.flush()
+                tail.append(line)
+                if a.echo:
+                    print(f"  | {line}", end="", flush=True)
+            rc = proc.wait()
         dt = time.perf_counter() - t0
-        (Path(a.out_prefix).parent / f"stream_chunk{i}.log").write_text(r.stdout + r.stderr)
-        if r.returncode != 0:
-            print(f"  FAILED rc={r.returncode}\n{r.stderr[-2000:]}", flush=True)
+        if rc != 0:
+            print(f"  FAILED rc={rc}\n{''.join(tail)[-2000:]}", flush=True)
             return 1
         row = summarise(out, prev)
         row["runtime_s"] = round(dt, 1)

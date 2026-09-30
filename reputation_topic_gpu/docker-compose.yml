@@ -5,6 +5,8 @@
 #   docker compose build
 #   docker compose run --rm base      # 200k base run  -> ${OUT_DIR}/base_200k
 #   docker compose run --rm stream    # 300k stream    -> ${OUT_DIR}/stream_1..6
+#   docker compose up dashboard       # web UI: start the run, watch it, see results
+#                                     # -> http://127.0.0.1:${DASHBOARD_PORT:-8765}
 #
 # Settings, exported in the shell or set in .env beside this file:
 #   CUDA_EXTRA   cu130 (driver >= 580) | cu126 (driver >= 560) | cpu
@@ -15,6 +17,7 @@
 #   DATA_DIR     host dir holding twcs_subset_200k.csv and stream300/chunk_*.csv
 #   OUT_DIR      host dir for every output, the UMAP model and buffers
 #   CACHE_DIR    host dir for the embedding cache (default: the topic-cache volume)
+#   DASHBOARD_PORT  host port for the dashboard (default 8765, bound to 127.0.0.1)
 #
 # The same .env supplies the AI Router credentials (api_key=, base_url=,
 # use_case=) to the container at run time; it is never baked into the image.
@@ -128,6 +131,24 @@ services:
       - --device=cuda
       - --max-vram-gb=${MAX_VRAM_GB:-2}
       - --embed-cache=/cache/embed
+
+  # Web dashboard. Runs the `base` and `stream` commands above itself (read
+  # from this file inside the image), streams each stage live, and serves the
+  # analytics from /out. It can start GPU runs, so the port is published on
+  # localhost only: reach it from your machine over an SSH tunnel.
+  dashboard:
+    <<: *topics
+    command:
+      - -m
+      - dashboard
+      - --host=0.0.0.0
+      - --port=8765
+      - --app-dir=/app
+      - --data-dir=/data
+      - --out-dir=/out
+      - --cache-dir=/cache
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-8765}:8765"
 
 volumes:
   topic-cache:

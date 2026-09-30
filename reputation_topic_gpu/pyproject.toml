@@ -33,6 +33,9 @@ dependencies = [
 cu130 = ["torch>=2.14,<3"]
 cu126 = ["torch>=2.14,<3"]
 cpu = ["torch>=2.14,<3"]
+# The web dashboard (dashboard/server.py): starts runs and serves analytics.
+# Independent of the torch extra -- combine it with any one of them.
+dashboard = ["fastapi>=0.115", "uvicorn>=0.30"]
 
 [tool.uv]
 # Flat scripts, not an installable package -- do not try to build a wheel of it.

@@ -4,6 +4,10 @@
 !*.py
 !README.md
 !DOCKER.md
+!docker-compose.yml
+!dashboard/
+dashboard/web/node_modules/
+dashboard/web/dist/
 
 # Runtime output and caches, excluded by name as well as by `*`: the `!*.py`
 # rule above makes BuildKit walk every directory looking for .py files, and

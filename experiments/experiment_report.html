@@ -131,7 +131,7 @@ footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
 <header class="top">
   <div class="eyebrow">Reputation topic generation · experiment log · 30 Sep 2026</div>
   <h1>768-dim embeddings and BERTopic against the current pipeline</h1>
-  <p class="lede prose">Two experimental copies of <code>reputation_topic_gpu</code>, each run on the 200k base corpus and then the 300k stream, compared with the unchanged code re-run on the same machine. Three of the four reports are in. The 768-dim stream is still to run.</p>
+  <p class="lede prose">Two experimental copies of <code>reputation_topic_gpu</code>, each run on the 200k base corpus and then the 300k stream, compared with the unchanged code re-run on the same machine. All four runs are in.</p>
   <div class="meta-row">
     <span>Intel Core 7 150U · 12 threads · 31 GiB · CPU only</span>
     <span>torch 2.14.0 · umap-learn 0.5.12 · sklearn 1.9.1 · bertopic 0.17.4</span>
@@ -145,7 +145,7 @@ footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
     <li><a href="#r768">768-dim · 200k</a><span class="status done">done</span></li>
     <li><a href="#rbt">BERTopic · 200k</a><span class="status done">done</span></li>
     <li><a href="#rbts">BERTopic · 300k stream</a><span class="status done">done</span></li>
-    <li><a href="#r768s">768-dim · 300k stream</a><span class="status pending">next</span></li>
+    <li><a href="#r768s">768-dim · 300k stream</a><span class="status done">done</span></li>
   </ol>
 </nav>
 
@@ -180,9 +180,9 @@ footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
   </div>
   <div class="verdict">
     <div style="border-left-color: var(--arm-768)">
-      <div class="k">768-dim, so far</div>
-      <div class="v">Slightly better topics at about 3.3× the cost</div>
-      <p>Fewer, larger topics and clearly better event grouping. Coherence gains are within noise. Embedding is 3.7× slower on CPU and peak RAM is 1.7× higher.</p>
+      <div class="k">768-dim, both phases</div>
+      <div class="v">Consistently cleaner topics, as stable, at about 3.7× the CPU cost</div>
+      <p>Fewer, larger topics. Published-set coherence is ahead in every stream batch (+0.014 on average), and ID retention matches the control. The event-grouping gain seen at 200k does not carry into the stream. Embedding is 3.7–4.3× slower on CPU.</p>
     </div>
     <div style="border-left-color: var(--arm-bertopic)">
       <div class="k">BERTopic, both phases</div>
@@ -445,10 +445,87 @@ footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
 </section>
 
 <section class="report" id="r768s">
-  <div class="eyebrow">Report 4 · stream · pending</div>
-  <h2>768-dim across the 300k stream</h2>
+  <div class="eyebrow">Report 4 · stream · stream300/chunk_1..6 · 296,313 records · window 3</div>
+  <h2>768-dim embeddings across the 300k stream</h2>
   <div class="prose">
-    <p>Starts after this page is published. Expect about 3–3.5 hours on this machine: the six chunks have to be embedded with the 768-dim encoder at about 34 segments a second. It will be added here, with the same per-batch tables, against both arms above.</p>
+    <p><strong>Over six batches the 768-dim arm keeps what it showed at 200k: fewer, larger topics and published-set coherence ahead of the control in every batch. It is as stable as the control (ID retention 0.974–0.991, no new IDs, no capacity merges). It costs 3.7× the stream time on CPU, almost all of it embedding.</strong> The event-grouping gain seen at 200k does not survive into the stream: recall ties and topics-for-80% is slightly worse.</p>
+  </div>
+
+  <div class="multiples">
+    <div class="chart"><h4>Live topics</h4><p class="sub">Registry size after each batch. Cap is 600.</p><svg id="svg4-live" role="img" aria-label="Live topics per batch, three arms"></svg></div>
+    <div class="chart"><h4>Topic ID retention</h4><p class="sub">Share of the previous batch's IDs still present.</p><svg id="svg4-ret" role="img" aria-label="ID retention per batch, three arms"></svg></div>
+    <div class="chart"><h4>Published-set C_npmi</h4><p class="sub">Fixed stream300 corpus, suppressed topics excluded.</p><svg id="svg4-coh" role="img" aria-label="Published-set coherence per batch, three arms"></svg></div>
+    <div class="chart"><h4>Minutes per batch, including embedding</h4><p class="sub">Stage timings (sleep excluded). BERTopic reused the control's vectors, so it is not shown.</p><svg id="svg4-cost" role="img" aria-label="Minutes per batch including embedding, control and 768-dim"></svg></div>
+  </div>
+  <div class="legend" id="legend-stream4"></div>
+
+  <h3>Per batch, 768-dim against control</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Measure</th><th>Arm</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="2">Live topics</td><td style="text-align:left">Control</td><td>365</td><td>403</td><td>441</td><td>484</td><td>516</td><td>594</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td>308</td><td>340</td><td>368</td><td>401</td><td>425</td><td>508</td></tr>
+      <tr><td rowspan="2">ID retention</td><td style="text-align:left">Control</td><td>0.972</td><td>0.986</td><td>0.985</td><td>0.992</td><td>0.996</td><td>0.945</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td>0.974</td><td>0.982</td><td>0.976</td><td>0.991</td><td>0.991</td><td>0.975</td></tr>
+      <tr><td rowspan="2">Median topic size</td><td style="text-align:left">Control</td><td>75</td><td>156</td><td>253</td><td>241</td><td>221</td><td>174</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td>100</td><td>216</td><td>324</td><td>316</td><td>298</td><td>223</td></tr>
+      <tr><td rowspan="2">C_npmi, published set</td><td style="text-align:left">Control</td><td>+0.102</td><td>+0.103</td><td>+0.121</td><td>+0.109</td><td>+0.102</td><td>+0.078</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td class="better">+0.118</td><td class="better">+0.123</td><td>+0.127</td><td>+0.116</td><td class="better">+0.117</td><td class="better">+0.099</td></tr>
+      <tr><td rowspan="2">C_v, published set</td><td style="text-align:left">Control</td><td>0.556</td><td>0.558</td><td>0.587</td><td>0.566</td><td>0.558</td><td>0.519</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td>0.587</td><td>0.589</td><td>0.590</td><td>0.578</td><td>0.581</td><td>0.546</td></tr>
+      <tr><td rowspan="2">Unassigned, holdout chunk</td><td style="text-align:left">Control</td><td>16.7%</td><td>3.0%</td><td>2.0%</td><td>2.7%</td><td>1.9%</td><td>2.7%</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td>11.9%</td><td>2.2%</td><td>2.2%</td><td>1.4%</td><td>2.4%</td><td>2.1%</td></tr>
+      <tr><td rowspan="2">Inflation</td><td style="text-align:left">Control</td><td>1.70</td><td>1.68</td><td>1.74</td><td>1.76</td><td>1.78</td><td>1.75</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td>1.80</td><td>1.77</td><td>1.81</td><td>1.82</td><td>1.83</td><td>1.83</td></tr>
+      <tr><td rowspan="2">Alerts (negative C_npmi)</td><td style="text-align:left">Control</td><td>0 (0)</td><td>4 (1)</td><td>7 (0)</td><td>3 (1)</td><td>14 (3)</td><td>4 (1)</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td>0 (0)</td><td>2 (1)</td><td>6 (0)</td><td>2 (0)</td><td>11 (0)</td><td>4 (1)</td></tr>
+      <tr><td rowspan="2">Events found · recall</td><td style="text-align:left">Control</td><td>7 · .576</td><td>8 · .571</td><td>8 · .529</td><td>8 · .497</td><td>8 · .483</td><td>10 · .548</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td>7 · .577</td><td>8 · .532</td><td>8 · .528</td><td>8 · .533</td><td>8 · .500</td><td>10 · .523</td></tr>
+      <tr><td rowspan="2">Topics for 80%</td><td style="text-align:left">Control</td><td>2.00</td><td>2.25</td><td>2.38</td><td>3.12</td><td>3.12</td><td>3.10</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td>2.00</td><td>2.50</td><td>2.62</td><td>3.12</td><td>3.50</td><td>3.20</td></tr>
+      <tr><td rowspan="2">Unclear labels</td><td style="text-align:left">Control</td><td>42</td><td>49</td><td>48</td><td>49</td><td>45</td><td>33</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td>34</td><td>41</td><td>38</td><td>33</td><td>27</td><td>31</td></tr>
+      <tr><td rowspan="2">UMAP drift</td><td style="text-align:left">Control</td><td>0.399</td><td>0.399</td><td>0.401</td><td>0.401</td><td>0.403</td><td>0.406</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td>0.373</td><td>0.379</td><td>0.380</td><td>0.381</td><td>0.383</td><td>0.383</td></tr>
+      <tr><td rowspan="2">Minutes (incl. embedding)</td><td style="text-align:left">Control</td><td>7.7</td><td>7.9</td><td>8.5</td><td>9.2</td><td>10.2</td><td>10.5</td></tr>
+      <tr><td style="text-align:left">768-dim</td><td>27.3</td><td>30.0</td><td>32.3</td><td>42.2</td><td>34.4</td><td>33.4</td></tr>
+    </tbody>
+  </table></div>
+  <p class="caption prose">Registry integrity held in every batch: 0 duplicate IDs, 0 phantom slots, 100% own-brand, 0 mis-tagged topics, 0 future <code>last_seen_at</code>. Neither arm needed a drift refit (threshold 0.45). The 768 manifold sits closer to incoming data throughout. Batch 4 is slow in the 768 arm (embedding 2,412 s against 1,570–1,950 s); that batch ran across the laptop's suspend and resume, so read its time with caution.</p>
+
+  <h3>Whole stream, all three arms</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Measure</th><th><span class="th-arm"><span class="swatch" style="background:var(--arm-control)"></span>Control</span></th><th><span class="th-arm"><span class="swatch" style="background:var(--arm-768)"></span>768-dim</span></th><th><span class="th-arm"><span class="swatch" style="background:var(--arm-bertopic)"></span>BERTopic</span></th></tr></thead>
+    <tbody>
+      <tr class="group"><td colspan="4">Stability</td></tr>
+      <tr><td>ID retention, range</td><td>0.945–0.996</td><td class="better">0.974–0.991</td><td class="worse">0.820–0.983</td></tr>
+      <tr><td>New stable IDs · capacity merges</td><td>0 · 18</td><td class="better">0 · 0</td><td class="worse">53 · 327</td></tr>
+      <tr><td>Label churn (topics in all 6 batches that changed label)</td><td>76 of 402 (19%)</td><td>82 of 349 (23%)</td><td class="worse">110 of 327 (34%)</td></tr>
+      <tr class="group"><td colspan="4">Quality (fixed stream300 corpus)</td></tr>
+      <tr><td>Published C_npmi, mean of 6 batches</td><td>+0.102</td><td class="better">+0.117</td><td class="worse">+0.066</td></tr>
+      <tr><td>Batches where it leads the control</td><td>—</td><td>6 of 6</td><td>0 of 6</td></tr>
+      <tr><td>Alerts total · with negative C_npmi</td><td>32 · 6</td><td class="better">25 · 2</td><td>39 · 5</td></tr>
+      <tr><td>Unclear labels, range</td><td>33–49</td><td class="better">27–41</td><td class="worse">47–70</td></tr>
+      <tr><td>Inflation, batch 6</td><td>1.75</td><td class="worse">1.83</td><td class="better">1.60</td></tr>
+      <tr><td>Final batch events · recall · topics for 80%</td><td>10/10 · 0.548 · 3.1</td><td>10/10 · 0.523 · 3.2</td><td class="better">10/10 · 0.646 · 2.3</td></tr>
+      <tr class="group"><td colspan="4">Cost</td></tr>
+      <tr><td>Embedding (6 new chunks)</td><td>2,667 s</td><td class="worse">11,333 s (4.25×)</td><td>reused</td></tr>
+      <tr><td>Compute excluding embedding</td><td>570 s</td><td>645 s (1.13×)</td><td class="worse">1,151 s (2.0×)</td></tr>
+      <tr><td>Stage total</td><td>3,236 s (54 min)</td><td class="worse">11,978 s (3 h 20 min, 3.70×)</td><td>1,151 s + 2,667 s if cold</td></tr>
+      <tr><td>CPU time</td><td>27,464 s</td><td>109,578 s (3.99×)</td><td>1,602 s</td></tr>
+      <tr><td>Peak RAM</td><td>4.49 GiB</td><td>6.31 GiB (1.41×)</td><td>3.32 GiB</td></tr>
+      <tr><td>LLM calls · tokens</td><td>550 · 688k</td><td class="better">468 · 581k (0.85×)</td><td class="worse">1,041 · 1,294k</td></tr>
+    </tbody>
+  </table></div>
+  <p class="caption prose">The 768 process ran 3 h 36 min by wall clock, but the laptop was suspended from 18:06 to 18:22 (954 s, confirmed in the system journal). The stage timings above exclude that sleep; the process wall clock does not. The six batches share overlapping three-chunk windows, so "6 of 6" is consistent evidence, not six independent trials.</p>
+
+  <div class="callout">
+    <strong>What to do with this.</strong>
+    <ul class="tight">
+      <li>This is the stronger test, and 768 passes it. The quality lead is small (+0.014 published C_npmi on average, about the noise floor) but it is ahead in every batch while matching the control's stability. 768 is the only change of the two worth pursuing.</li>
+      <li>Retune the similarity thresholds in the 768 space before the next run. Inflation is the highest of any arm (1.83 by batch 6) and first-batch unassigned is lower. Both point to the 0.50 floor being looser in mpnet's space.</li>
+      <li>The deciding question is cost on the real hardware. On this CPU the stream takes 3.7× as long. Next is the GPU run on the local laptop (the 768 copy is now uncapped for it); on GPU, embedding is a much smaller share of each batch.</li>
+    </ul>
   </div>
 </section>
 
@@ -538,6 +615,12 @@ footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
     coh: { control: [0.102, 0.1026, 0.1206, 0.1086, 0.102, 0.0783], bertopic: [0.0471, 0.0709, 0.0769, 0.0779, 0.0583, 0.065], min: 0.04, max: 0.13, ticks: [0.04, 0.07, 0.10, 0.13], d: 3 },
     cost: { control: [58.0, 75.3, 108.4, 106.1, 108.2, 113.9], bertopic: [114.0, 160.3, 221.0, 215.0, 212.1, 228.3], min: 0, max: 250, ticks: [0, 50, 100, 150, 200, 250], d: 0 }
   };
+  var S4 = {
+    live: { control: S.live.control, emb768: [308, 340, 368, 401, 425, 508], bertopic: S.live.bertopic, min: 300, max: 700, ticks: [300, 400, 500, 600, 700], d: 0, cap: 600 },
+    ret: { control: S.ret.control, emb768: [0.9735, 0.9816, 0.9756, 0.9907, 0.9913, 0.9751], bertopic: S.ret.bertopic, min: 0.8, max: 1.0, ticks: [0.8, 0.85, 0.9, 0.95, 1.0], d: 3 },
+    coh: { control: S.coh.control, emb768: [0.1175, 0.1232, 0.1274, 0.1159, 0.1168, 0.0991], bertopic: S.coh.bertopic, min: 0.04, max: 0.13, ticks: [0.04, 0.07, 0.10, 0.13], d: 3 },
+    cost: { control: [7.7, 7.9, 8.5, 9.2, 10.2, 10.5], emb768: [27.3, 30.0, 32.3, 42.2, 34.4, 33.4], min: 0, max: 45, ticks: [0, 15, 30, 45], d: 1 }
+  };
   function lineChart(id, spec) {
     var svg = document.getElementById(id);
     var W = 420, H = 210, L = 44, R = 64, T = 10, B = 26;
@@ -590,5 +673,10 @@ footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
   lineChart("svg-ret", S.ret);
   lineChart("svg-coh", S.coh);
   lineChart("svg-cost", S.cost);
+  legend("legend-stream4", ["control", "emb768", "bertopic"]);
+  lineChart("svg4-live", S4.live);
+  lineChart("svg4-ret", S4.ret);
+  lineChart("svg4-coh", S4.coh);
+  lineChart("svg4-cost", S4.cost);
 })();
 </script>
