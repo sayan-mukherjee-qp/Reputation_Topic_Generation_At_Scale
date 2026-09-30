@@ -1,0 +1,30 @@
+# Use when `docker compose run` fails with
+#   could not select device driver "nvidia" with capabilities: [[gpu]]
+# but `docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all ubuntu nvidia-smi`
+# works. That means the nvidia runtime is registered with Docker but the
+# `--gpus` / deploy.devices path (which needs nvidia-container-runtime-hook)
+# is not. This selects the GPU through the runtime instead:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.nvidia-runtime.yml run --rm base
+#
+# or once per shell:
+#   export COMPOSE_FILE=docker-compose.yml:docker-compose.nvidia-runtime.yml
+
+x-runtime: &runtime
+  runtime: nvidia
+  environment:
+    NVIDIA_VISIBLE_DEVICES: "${GPU_ID:-0}"
+    NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+# `deploy: !reset null` drops the base file's GPU device request. It has to sit
+# on each service: a !reset inside a merged anchor is not applied.
+services:
+  topics:
+    <<: *runtime
+    deploy: !reset null
+  base:
+    <<: *runtime
+    deploy: !reset null
+  stream:
+    <<: *runtime
+    deploy: !reset null

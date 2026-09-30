@@ -1,0 +1,19 @@
+*
+!pyproject.toml
+!uv.lock
+!*.py
+!README.md
+!DOCKER.md
+
+# Runtime output and caches, excluded by name as well as by `*`: the `!*.py`
+# rule above makes BuildKit walk every directory looking for .py files, and
+# the ones a container wrote into (out_docker/) may be unreadable on the host.
+out*/
+buf*/
+models/
+data/
+embed_cache/
+__pycache__/
+.work/
+.venv/
+.env

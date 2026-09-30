@@ -1,0 +1,594 @@
+<title>Topic Pipeline Experiments</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,500;8..60,650&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a single reading column (~72ch) for prose, tables allowed to run wider in their own scrollers; sticky section nav. */
+:root {
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --ink: #14181f;
+  --ink-2: #4a5261;
+  --ink-3: #6b7383;
+  --rule: #dde1e8;
+  --rule-strong: #c4cad4;
+  --accent: #1f4f8f;
+  --accent-soft: #e6edf7;
+  --good: #1f7a4a;
+  --good-soft: #e3f3ea;
+  --warn: #9a5b00;
+  --warn-soft: #fbf0dc;
+  --bad: #b3261e;
+  --bad-soft: #fbe7e5;
+  --arm-control: #2a78d6;
+  --arm-768: #eb6834;
+  --arm-bertopic: #1baf7a;
+  --grid: #e8ebf0;
+  --font-display: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151a; --surface: #1a1e25; --ink: #eef1f5; --ink-2: #b9c0cc; --ink-3: #8e97a6;
+    --rule: #2c323c; --rule-strong: #3b4350; --accent: #8db6ec; --accent-soft: #1e2a3b;
+    --good: #6fd19a; --good-soft: #17291f; --warn: #e5b25c; --warn-soft: #2d2415;
+    --bad: #f08a82; --bad-soft: #321b1a;
+    --arm-control: #3987e5; --arm-768: #d95926; --arm-bertopic: #199e70; --grid: #262c35;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12151a; --surface: #1a1e25; --ink: #eef1f5; --ink-2: #b9c0cc; --ink-3: #8e97a6;
+  --rule: #2c323c; --rule-strong: #3b4350; --accent: #8db6ec; --accent-soft: #1e2a3b;
+  --good: #6fd19a; --good-soft: #17291f; --warn: #e5b25c; --warn-soft: #2d2415;
+  --bad: #f08a82; --bad-soft: #321b1a;
+  --arm-control: #3987e5; --arm-768: #d95926; --arm-bertopic: #199e70; --grid: #262c35;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font-family: var(--font-body); font-size: 15px; line-height: 1.6; margin: 0; }
+.wrap { max-width: 1040px; margin: 0 auto; padding-inline: 20px; padding-block: 28px 64px; }
+.prose { max-width: 72ch; }
+h1, h2, h3 { font-family: var(--font-display); font-weight: 650; text-wrap: balance; line-height: 1.2; margin: 0; }
+h1 { font-size: 2.1rem; letter-spacing: -0.01em; }
+h2 { font-size: 1.55rem; margin-block: 0 6px; }
+h3 { font-size: 1.12rem; margin-block: 28px 8px; }
+p { margin-block: 0 12px; }
+.eyebrow { font-family: var(--font-mono); font-size: 0.74rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
+.lede { font-size: 1.05rem; color: var(--ink-2); margin-top: 10px; }
+code, .mono { font-family: var(--font-mono); font-size: 0.86em; }
+code { background: var(--accent-soft); padding: 1px 5px; border-radius: 3px; }
+a { color: var(--accent); }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+header.top { display: grid; gap: 10px; padding-bottom: 22px; border-bottom: 1px solid var(--rule); }
+.meta-row { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 0.85rem; color: var(--ink-3); }
+.meta-row span { font-family: var(--font-mono); }
+
+nav.sections { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--bg); border-bottom: 1px solid var(--rule); margin-inline: -20px; padding-inline: 20px; }
+nav.sections ol { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 22px; margin: 0; padding-block: 10px; padding-inline: 0; font-size: 0.88rem; }
+nav.sections a { text-decoration: none; color: var(--ink-2); }
+nav.sections a:hover { color: var(--accent); }
+.status { font-family: var(--font-mono); font-size: 0.72rem; padding: 1px 7px; border-radius: 999px; margin-left: 6px; vertical-align: 1px; }
+.status.done { background: var(--good-soft); color: var(--good); }
+.status.pending { background: var(--warn-soft); color: var(--warn); }
+
+section.report { padding-block: 36px 8px; border-bottom: 1px solid var(--rule); scroll-margin-top: 56px; }
+
+.arms { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-block: 18px 6px; }
+.arm { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 16px; display: grid; gap: 4px; min-width: 0; }
+.arm .name { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+.arm .dir { font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink-3); overflow-wrap: anywhere; }
+.arm p { font-size: 0.88rem; color: var(--ink-2); margin: 0; }
+
+.verdict { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; margin-block: 20px 4px; }
+.verdict > div { border-left: 3px solid var(--rule-strong); padding: 2px 0 2px 14px; min-width: 0; }
+.verdict .k { font-family: var(--font-mono); font-size: 0.74rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); }
+.verdict .v { font-family: var(--font-display); font-size: 1.12rem; font-weight: 650; margin-block: 2px 4px; }
+.verdict p { font-size: 0.9rem; color: var(--ink-2); margin: 0; }
+
+.tbl { overflow-x: auto; margin-block: 10px 6px; border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.86rem; font-variant-numeric: tabular-nums; }
+th, td { padding: 7px 12px; text-align: right; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; white-space: normal; min-width: 180px; }
+thead th { font-weight: 600; color: var(--ink-2); background: var(--bg); position: sticky; top: 0; }
+tbody tr:last-child td { border-bottom: 0; }
+tr.group td { background: var(--bg); font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); padding-block: 5px; }
+td.better { color: var(--good); font-weight: 600; }
+td.worse { color: var(--bad); font-weight: 600; }
+td.note, th.note { text-align: left; color: var(--ink-3); white-space: normal; min-width: 200px; font-size: 0.82rem; }
+.caption { font-size: 0.82rem; color: var(--ink-3); margin-top: 4px; }
+.th-arm { display: inline-flex; align-items: center; gap: 6px; }
+
+.callout { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 16px; margin-block: 14px; }
+.callout.warn { background: var(--warn-soft); border-color: transparent; }
+.callout strong { font-weight: 600; }
+ul.tight { margin-block: 6px 12px; padding-left: 20px; }
+ul.tight li { margin-block: 4px; }
+
+.chart { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 14px 8px; margin-block: 12px; min-width: 0; }
+.chart h4 { font-family: var(--font-body); font-size: 0.88rem; font-weight: 600; margin: 0 0 2px; }
+.chart .sub { font-size: 0.78rem; color: var(--ink-3); margin: 0 0 6px; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart svg text { fill: var(--ink-2); font-family: var(--font-mono); font-size: 11px; }
+.chart svg .lbl { fill: var(--ink); }
+.chart svg .grid { stroke: var(--grid); stroke-width: 1; }
+.chart svg .axis { stroke: var(--rule-strong); stroke-width: 1; }
+.multiples { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.8rem; color: var(--ink-2); margin-block: 6px 2px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+#tip { position: fixed; pointer-events: none; z-index: 20; background: var(--ink); color: var(--bg); font-family: var(--font-mono); font-size: 0.75rem; line-height: 1.45; padding: 6px 9px; border-radius: 4px; max-width: 260px; }
+
+footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
+@media (max-width: 560px) { h1 { font-size: 1.65rem; } th:first-child, td:first-child { min-width: 140px; } }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+
+<div class="wrap">
+<header class="top">
+  <div class="eyebrow">Reputation topic generation · experiment log · 30 Sep 2026</div>
+  <h1>768-dim embeddings and BERTopic against the current pipeline</h1>
+  <p class="lede prose">Two experimental copies of <code>reputation_topic_gpu</code>, each run on the 200k base corpus and then the 300k stream, compared with the unchanged code re-run on the same machine. Three of the four reports are in. The 768-dim stream is still to run.</p>
+  <div class="meta-row">
+    <span>Intel Core 7 150U · 12 threads · 31 GiB · CPU only</span>
+    <span>torch 2.14.0 · umap-learn 0.5.12 · sklearn 1.9.1 · bertopic 0.17.4</span>
+    <span>LLM labels: AI Router v1, gpt-4.1-mini</span>
+  </div>
+</header>
+
+<nav class="sections" aria-label="Reports">
+  <ol>
+    <li><a href="#setup">Setup</a></li>
+    <li><a href="#r768">768-dim · 200k</a><span class="status done">done</span></li>
+    <li><a href="#rbt">BERTopic · 200k</a><span class="status done">done</span></li>
+    <li><a href="#rbts">BERTopic · 300k stream</a><span class="status done">done</span></li>
+    <li><a href="#r768s">768-dim · 300k stream</a><span class="status pending">next</span></li>
+  </ol>
+</nav>
+
+<section class="report" id="setup">
+  <div class="eyebrow">Setup</div>
+  <h2>Three arms, one machine, one interpreter</h2>
+  <div class="arms">
+    <div class="arm">
+      <div class="name"><span class="swatch" style="background: var(--arm-control)"></span>Control</div>
+      <div class="dir">reputation_topic_gpu/</div>
+      <p>Unchanged code. 384-dim <code>paraphrase-multilingual-MiniLM-L12-v2</code>, frozen per-brand UMAP (50k reference sample) + HDBSCAN.</p>
+    </div>
+    <div class="arm">
+      <div class="name"><span class="swatch" style="background: var(--arm-768)"></span>768-dim</div>
+      <div class="dir">reputation_topic_gpu_768/</div>
+      <p>Only the encoder changes: 768-dim <code>paraphrase-multilingual-mpnet-base-v2</code>. Every threshold is left as tuned for 384-dim.</p>
+    </div>
+    <div class="arm">
+      <div class="name"><span class="swatch" style="background: var(--arm-bertopic)"></span>BERTopic</div>
+      <div class="dir">reputation_topic_gpu_bertopic/</div>
+      <p>Same 384-dim vectors. Discovery, candidate and recovery clustering handed to a fresh <code>BERTopic</code> fit per brand pool, library defaults.</p>
+    </div>
+  </div>
+  <div class="prose">
+    <ul class="tight">
+      <li><strong>Why a control run.</strong> The earlier GPU runs were on other hardware, and timings across machines do not compare. The control re-runs the current code here with the exact <code>docker compose</code> base and stream flags. It reproduces the earlier runs (429 topics against 426–427, 10/10 events), so the baseline is sound.</li>
+      <li><strong>BERTopic still uses UMAP and HDBSCAN.</strong> They are its default components. What goes away is the pipeline's machinery around them: the frozen manifold reused across runs, the tuned settings (30 neighbours, <code>min_samples</code> 10), the epsilon merge, the Ward split of oversized clusters and drift refits. BERTopic defaults are 15 neighbours and <code>min_samples</code> = <code>min_topic_size</code> = 30, refitted on every pool, every run.</li>
+      <li><strong>Embedding reuse.</strong> The BERTopic arm uses the same model on the same text as the control, so it reads the control's cached vectors. Its timings exclude embedding; add the control's embedding time for a cold-run figure.</li>
+      <li><strong>Coherence yardstick.</strong> C_v and C_npmi are the same implementation as every earlier review (c-TF-IDF top-10 terms, ε-smoothed), scored against one fixed corpus per phase: the raw 200k CSV for base runs, the six raw stream chunks for the stream. No arm's own segmentation can move it.</li>
+      <li><strong>Noise floor.</strong> Two runs of the same code on the same input differed by 0.014 in published-set C_npmi (the local vs cloud comparison of 29 Sep). Treat gaps smaller than that as a tie.</li>
+    </ul>
+  </div>
+  <div class="verdict">
+    <div style="border-left-color: var(--arm-768)">
+      <div class="k">768-dim, so far</div>
+      <div class="v">Slightly better topics at about 3.3× the cost</div>
+      <p>Fewer, larger topics and clearly better event grouping. Coherence gains are within noise. Embedding is 3.7× slower on CPU and peak RAM is 1.7× higher.</p>
+    </div>
+    <div style="border-left-color: var(--arm-bertopic)">
+      <div class="k">BERTopic, both phases</div>
+      <div class="v">Not a drop-in replacement at library defaults</div>
+      <p>Fragments topics until the 600 cap binds, loses 0.04 published C_npmi, and in the stream needs twice the compute outside embedding while ID retention falls to 0.82.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ======================================================= 768 @ 200k -->
+<section class="report" id="r768">
+  <div class="eyebrow">Report 1 · base run · twcs_subset_200k.csv · 198,314 records</div>
+  <h2>768-dim embeddings at 200k</h2>
+  <div class="prose">
+    <p><strong>The wider encoder makes coarser, cleaner topics and groups events better. It costs 3.7× the embedding time and has not moved coherence past noise.</strong> Its adjusted mutual information against the control is 0.74, so this is a genuinely different topic set rather than a relabelling.</p>
+  </div>
+
+  <h3>Integrity and structure</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Measure</th><th><span class="th-arm"><span class="swatch" style="background:var(--arm-control)"></span>Control</span></th><th><span class="th-arm"><span class="swatch" style="background:var(--arm-768)"></span>768-dim</span></th><th class="note">Reading</th></tr></thead>
+    <tbody>
+      <tr><td>Topics (all live)</td><td>429</td><td>378</td><td class="note">12% fewer; 0 duplicate merges fired at 0.92</td></tr>
+      <tr><td>Duplicate IDs · phantom slots · zero-size</td><td>0 · 0 · 0</td><td>0 · 0 · 0</td><td class="note">Write-time guarantees hold</td></tr>
+      <tr><td>Own-brand rate · mis-tagged topics</td><td>100.0% · 0</td><td>100.0% · 0</td><td class="note"></td></tr>
+      <tr><td>Median topic size</td><td>428</td><td>521</td><td class="note"></td></tr>
+      <tr><td>Volume in topics of 1,000+</td><td>51.9%</td><td>61.3%</td><td class="note">The band that scores best in every run</td></tr>
+      <tr><td>Volume in topics of 101–300</td><td>9.3%</td><td>5.3%</td><td class="note"></td></tr>
+      <tr><td>Unassigned segments</td><td>17.3%</td><td class="better">12.6%</td><td class="note">Partly a threshold effect (see below)</td></tr>
+      <tr><td>Inflation (assignments per segment)</td><td>1.65×</td><td class="worse">1.74×</td><td class="note">More second-topic matches clear the same 0.50 floor</td></tr>
+      <tr><td>AMI / ARI against control</td><td>—</td><td>0.740 / 0.410</td><td class="note">Over 157,284 segments assigned in both</td></tr>
+    </tbody>
+  </table></div>
+  <p class="caption prose">Lower unassigned and higher inflation move together. mpnet's cosine similarities sit higher than MiniLM's, so the 0.50 assignment floor tuned for 384-dim is effectively looser here. That buys coverage but also double-counting, and it is the first thing to retune before trusting the 768 numbers.</p>
+
+  <h3>Quality, against the fixed 200k corpus</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Measure</th><th>Control</th><th>768-dim</th><th>Δ</th></tr></thead>
+    <tbody>
+      <tr><td>C_v (all topics)</td><td>0.517</td><td>0.528</td><td>+0.011</td></tr>
+      <tr><td>C_npmi (all topics)</td><td>+0.073</td><td>+0.075</td><td>+0.002</td></tr>
+      <tr><td>C_npmi, size-weighted</td><td>+0.135</td><td>+0.141</td><td>+0.007</td></tr>
+      <tr><td>C_npmi, published set</td><td>+0.120 <span class="mono">(85.8% vol)</span></td><td>+0.127 <span class="mono">(86.8% vol)</span></td><td>+0.007</td></tr>
+      <tr><td>C_v, published set</td><td>0.575</td><td>0.586</td><td>+0.011</td></tr>
+      <tr class="group"><td colspan="4">C_npmi by size band</td></tr>
+      <tr><td>≤100 members</td><td>−0.072</td><td>−0.081</td><td>−0.009</td></tr>
+      <tr><td>101–300</td><td>+0.024</td><td>−0.002</td><td>−0.026</td></tr>
+      <tr><td>301–1,000</td><td>+0.106</td><td>+0.077</td><td class="worse">−0.029</td></tr>
+      <tr><td>1,000+</td><td>+0.161</td><td>+0.180</td><td class="better">+0.019</td></tr>
+      <tr class="group"><td colspan="4">Flags and alerts</td></tr>
+      <tr><td>Suppressed topics (gate gap)</td><td>100 (0.201)</td><td>91 (0.214)</td><td></td></tr>
+      <tr><td>Alerts · with negative C_npmi</td><td>14 · 1</td><td>11 · 0</td><td></td></tr>
+      <tr><td>Unclear labels · campaign clusters</td><td>38 · 4</td><td>39 · 4</td><td></td></tr>
+      <tr><td>Same-brand identical-label groups</td><td>5 (7,077 slots)</td><td class="worse">8 (12,107 slots)</td><td></td></tr>
+    </tbody>
+  </table></div>
+  <p class="caption prose">Every aggregate moves the right way, but none by more than the 0.014 run-to-run noise. The gain comes from shifting volume into big topics, which score best. Mid-sized 768 topics are actually less coherent. The open label-merge gap from earlier reviews widens slightly (8 surviving same-brand groups against 5).</p>
+
+  <h3>Event recall, the clearest gain</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Event</th><th>Control recall</th><th>768 recall</th><th>Control topics for 80%</th><th>768 topics for 80%</th></tr></thead>
+    <tbody>
+      <tr><td>iOS 11 complaint wave</td><td>0.676</td><td class="better">0.874</td><td>2</td><td class="better">1</td></tr>
+      <tr><td>Spotify iOS/playback failures</td><td>0.370</td><td class="better">0.597</td><td>3</td><td class="better">2</td></tr>
+      <tr><td>Comcast/Xfinity outage</td><td>0.585</td><td class="better">0.700</td><td>2</td><td>2</td></tr>
+      <tr><td>Uber cancellation / fare disputes</td><td>0.934</td><td>0.985</td><td>1</td><td>1</td></tr>
+      <tr><td>McDonald's Szechuan sauce</td><td>0.916</td><td>0.908</td><td>1</td><td>1</td></tr>
+      <tr><td>Southwest / American delays</td><td>0.337</td><td>0.334</td><td>3</td><td>3</td></tr>
+      <tr><td>Windows 10 1709 drivers</td><td>0.331</td><td>0.369</td><td>3</td><td class="worse">4</td></tr>
+      <tr><td>Virgin Trains strike</td><td>0.344</td><td>0.312</td><td>5</td><td class="better">3</td></tr>
+      <tr><td>Amazon Prime billing</td><td>0.803</td><td class="worse">0.735</td><td>1</td><td class="worse">2</td></tr>
+      <tr><td>Black Friday / Cyber Monday</td><td>0.122</td><td>0.126</td><td>23</td><td class="better">14</td></tr>
+      <tr class="group"><td colspan="5">Summary</td></tr>
+      <tr><td>Found · mean recall · mean topics for 80%</td><td>10/10 · 0.542 · 4.4</td><td colspan="3" style="text-align:left">10/10 · <strong>0.594</strong> · <strong>3.3</strong></td></tr>
+    </tbody>
+  </table></div>
+  <p class="caption prose">Most of the topics-for-80% gain is Black Friday (23 → 14). Without it the mean is 2.33 against 2.11. Recall gains are concentrated in the software and outage events, where the larger encoder evidently separates the complaint from the surrounding chatter better.</p>
+
+  <h3>Cost</h3>
+  <div class="chart" id="chart-base-time">
+    <h4>Wall time by stage, 200k base run</h4>
+    <p class="sub">Seconds, from stage_timing.json. BERTopic reused the control's vectors, so its embedding bar is empty.</p>
+    <div class="legend" id="legend-base"></div>
+    <svg id="svg-base-time" role="img" aria-label="Grouped bar chart of seconds per stage for each arm"></svg>
+  </div>
+  <div class="tbl"><table>
+    <thead><tr><th>Measure</th><th>Control</th><th>768-dim</th><th>Ratio</th></tr></thead>
+    <tbody>
+      <tr><td>Embedding</td><td>1,568 s <span class="mono">(126 seg/s)</span></td><td>5,775 s <span class="mono">(34 seg/s)</span></td><td class="worse">3.68×</td></tr>
+      <tr><td>Everything after embedding</td><td>283 s</td><td>300 s</td><td>1.06×</td></tr>
+      <tr><td>Wall clock (process)</td><td>30 m 56 s</td><td>1 h 41 m 21 s</td><td class="worse">3.28×</td></tr>
+      <tr><td>CPU time</td><td>15,909 s</td><td>56,432 s</td><td>3.55×</td></tr>
+      <tr><td>Peak RAM</td><td>4.39 GiB</td><td>7.65 GiB</td><td class="worse">1.74×</td></tr>
+      <tr><td>UMAP artifact on disk</td><td colspan="2" style="text-align:left">per-brand, 13 manifolds, fitted on 50k reference segments in both</td><td></td></tr>
+      <tr><td>LLM calls · tokens</td><td>436 · 550k</td><td>389 · 489k</td><td class="better">0.89×</td></tr>
+    </tbody>
+  </table></div>
+  <p class="caption prose">Past embedding, the 768 run costs the same: UMAP compresses both spaces to 5 dimensions before HDBSCAN sees them. Fewer topics make LLM labelling 11% cheaper. On the GPU deployment embedding is a smaller share (154 s of 482 s for MiniLM on the 28 Sep run), so if the 3.7× ratio holds on GPU the 768 base run would take roughly 900 s rather than 480 s. That figure is a projection, not a measurement.</p>
+
+  <div class="callout">
+    <strong>What to do with this.</strong>
+    <ul class="tight">
+      <li>Don't adopt on this run alone. The coherence gain is inside noise; the event-grouping gain is real but modest outside Black Friday.</li>
+      <li>Retune <code>--min-similarity</code>, <code>--duplicate-similarity</code> and <code>--label-merge-similarity</code> in the 768 space first. The 0.50 floor clearly means something different here (unassigned −4.7 pp, inflation +0.09).</li>
+      <li>The 768-dim stream, which runs next, is the stronger test: whether the coarser topics hold their IDs and coherence across six batches.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ======================================================= BERTopic @ 200k -->
+<section class="report" id="rbt">
+  <div class="eyebrow">Report 2 · base run · twcs_subset_200k.csv · 198,314 records</div>
+  <h2>BERTopic at 200k</h2>
+  <div class="prose">
+    <p><strong>BERTopic at its defaults finds far more, far smaller topics. That fragmentation costs 0.04 in published-set C_npmi (three times the noise floor) and drives the registry into its 600-topic cap.</strong> It is faster to cluster at this size, finds all ten events and double-counts less.</p>
+  </div>
+
+  <h3>Integrity and structure</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Measure</th><th><span class="th-arm"><span class="swatch" style="background:var(--arm-control)"></span>Control</span></th><th><span class="th-arm"><span class="swatch" style="background:var(--arm-bertopic)"></span>BERTopic</span></th><th class="note">Reading</th></tr></thead>
+    <tbody>
+      <tr><td>Topics from discovery</td><td>—</td><td>668</td><td class="note">46–79 per brand pool, 26–52% noise per pool</td></tr>
+      <tr><td>Live topics before the cap</td><td>436</td><td>738</td><td class="note">Cap is <code>--max-live-topics 600</code></td></tr>
+      <tr><td>Capacity merges</td><td>0</td><td class="worse">138</td><td class="note">First run in the series to exercise consolidation</td></tr>
+      <tr><td>Topics written</td><td>429</td><td>598</td><td class="note"></td></tr>
+      <tr><td>Duplicate IDs · phantom slots · zero-size</td><td>0 · 0 · 0</td><td>0 · 0 · 0</td><td class="note">Holds even after 138 forced merges</td></tr>
+      <tr><td>Own-brand rate</td><td>100.0%</td><td>100.0%</td><td class="note"></td></tr>
+      <tr><td>Median topic size</td><td>428</td><td class="worse">226</td><td class="note"></td></tr>
+      <tr><td>Volume ≤100 / 101–300 members</td><td>0.6% / 9.3%</td><td class="worse">2.4% / 16.5%</td><td class="note">The bands that score at or below zero</td></tr>
+      <tr><td>Unassigned segments</td><td>17.3%</td><td class="better">13.5%</td><td class="note"></td></tr>
+      <tr><td>Inflation</td><td>1.65×</td><td class="better">1.55×</td><td class="note">Finer centroids are more selective</td></tr>
+      <tr><td>AMI / ARI against control</td><td>—</td><td>0.822 / 0.555</td><td class="note">Mostly the control's topics, split further</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Quality, against the fixed 200k corpus</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Measure</th><th>Control</th><th>BERTopic</th><th>Δ</th></tr></thead>
+    <tbody>
+      <tr><td>C_v (all topics)</td><td>0.517</td><td>0.462</td><td class="worse">−0.055</td></tr>
+      <tr><td>C_npmi (all topics)</td><td>+0.073</td><td>+0.028</td><td class="worse">−0.045</td></tr>
+      <tr><td>C_npmi, size-weighted</td><td>+0.135</td><td>+0.113</td><td class="worse">−0.022</td></tr>
+      <tr><td>C_npmi, published set</td><td>+0.120 <span class="mono">(85.8% vol)</span></td><td>+0.079 <span class="mono">(84.2% vol)</span></td><td class="worse">−0.041</td></tr>
+      <tr><td>C_v, published set</td><td>0.575</td><td>0.514</td><td class="worse">−0.061</td></tr>
+      <tr class="group"><td colspan="4">C_npmi by size band</td></tr>
+      <tr><td>≤100 members</td><td>−0.072</td><td>−0.062</td><td>+0.010</td></tr>
+      <tr><td>101–300</td><td>+0.024</td><td>+0.003</td><td>−0.021</td></tr>
+      <tr><td>301–1,000</td><td>+0.106</td><td>+0.073</td><td class="worse">−0.033</td></tr>
+      <tr><td>1,000+</td><td>+0.161</td><td>+0.181</td><td class="better">+0.020</td></tr>
+      <tr class="group"><td colspan="4">Flags, labels and alerts</td></tr>
+      <tr><td>Suppressed topics (gate gap)</td><td>100 (0.201)</td><td class="worse">160 (0.195)</td><td></td></tr>
+      <tr><td>Unclear labels · campaign clusters</td><td>38 · 4</td><td class="worse">67 · 10</td><td></td></tr>
+      <tr><td>Same-brand identical-label groups</td><td>5 (7,077 slots)</td><td class="worse">12 (13,771 slots)</td><td></td></tr>
+      <tr><td>Label merges fired</td><td>7</td><td>2</td><td></td></tr>
+      <tr><td>Alerts · with negative C_npmi</td><td>14 · 1</td><td>13 · 1</td><td></td></tr>
+      <tr><td>Events found · mean recall · topics for 80%</td><td>10/10 · 0.542 · 4.4</td><td>10/10 · 0.536 · 4.1</td><td>tie</td></tr>
+    </tbody>
+  </table></div>
+  <p class="caption prose">BERTopic's big topics are as good as the control's, or better. The loss is volume pushed into the mid and small bands, where coherence is weak in every run. Twelve same-brand groups share one LLM label (Delta "Flight delays and cancellations" ×2, 2,657 slots; Comcast "Internet service outages" ×2, 2,340 slots). The LLM sees them as one topic where BERTopic's geometry kept them apart.</p>
+
+  <h3>Cost</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Stage</th><th>Control</th><th>BERTopic</th><th class="note">Reading</th></tr></thead>
+    <tbody>
+      <tr><td>UMAP fit + discovery clustering</td><td>117 + 68 = 185 s</td><td class="better">120 s</td><td class="note">BERTopic fits UMAP on every pool; no 50k reference fit</td></tr>
+      <tr><td>Candidate discovery</td><td>6.8 s</td><td>14.7 s</td><td class="note">A fresh fit per leftover pool</td></tr>
+      <tr><td>LLM labelling · calls · tokens</td><td>59 s · 436 · 550k</td><td class="worse">76 s · 600 · 751k</td><td class="note">+37% tokens</td></tr>
+      <tr><td>Everything except embedding</td><td>283 s</td><td class="better">246 s</td><td class="note">13% faster</td></tr>
+      <tr><td>Cold-run equivalent (add control's embedding)</td><td>1,851 s</td><td>1,814 s</td><td class="note">Embedding dominates both</td></tr>
+      <tr><td>CPU utilisation</td><td>8.6× (embedding)</td><td>1.1×</td><td class="note">Pinned <code>random_state</code> runs BERTopic's UMAP single-threaded</td></tr>
+      <tr><td>Peak RAM</td><td>4.39 GiB</td><td>3.18 GiB</td><td class="note">Not like-for-like: control peak includes the encoder</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout">
+    <strong>What to do with this.</strong>
+    <ul class="tight">
+      <li>At library defaults BERTopic is not a replacement. The quality loss is outside noise and the extra topics cost 37% more LLM spend.</li>
+      <li>If you want to push BERTopic further, move it toward the tuned configuration: <code>--bertopic-neighbors 30</code> and <code>--bertopic-min-samples 10</code> (both flags exist in the copy), or a larger <code>min_topic_size</code>. That tests BERTopic as a framework rather than its defaults.</li>
+      <li>Unpinning <code>random_state</code> would let UMAP use all cores, at the cost of reproducibility.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ======================================================= BERTopic stream -->
+<section class="report" id="rbts">
+  <div class="eyebrow">Report 3 · stream · stream300/chunk_1..6 · 296,313 records · window 3</div>
+  <h2>BERTopic across the 300k stream</h2>
+  <div class="prose">
+    <p><strong>In the stream BERTopic's cost advantage reverses. With no frozen manifold every batch refits UMAP on the whole three-chunk window, so UMAP plus discovery clustering takes 2.5× as long. The registry hits the cap at batch 3 and stays there, and ID retention decays to 0.82 by batch 6.</strong> Event recall ends higher and inflation stays lower, but published-set coherence trails the control in every batch.</p>
+  </div>
+
+  <div class="multiples">
+    <div class="chart"><h4>Live topics</h4><p class="sub">Registry size after each batch. Cap is 600.</p><svg id="svg-live" role="img" aria-label="Live topics per batch"></svg></div>
+    <div class="chart"><h4>Topic ID retention</h4><p class="sub">Share of the previous batch's IDs still present.</p><svg id="svg-ret" role="img" aria-label="ID retention per batch"></svg></div>
+    <div class="chart"><h4>Published-set C_npmi</h4><p class="sub">Fixed stream300 corpus, suppressed topics excluded.</p><svg id="svg-coh" role="img" aria-label="Published-set coherence per batch"></svg></div>
+    <div class="chart"><h4>Compute per batch, excluding embedding</h4><p class="sub">Seconds. Embedding is identical work in both arms.</p><svg id="svg-cost" role="img" aria-label="Seconds per batch excluding embedding"></svg></div>
+  </div>
+  <div class="legend" id="legend-stream"></div>
+
+  <h3>Per batch</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Measure</th><th>Arm</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="2">Live topics</td><td style="text-align:left">Control</td><td>365</td><td>403</td><td>441</td><td>484</td><td>516</td><td>594</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>527</td><td>578</td><td>595</td><td>597</td><td>599</td><td>629</td></tr>
+      <tr><td rowspan="2">Capacity merges</td><td style="text-align:left">Control</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>18</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>0</td><td>0</td><td>73</td><td>63</td><td>81</td><td>110</td></tr>
+      <tr><td rowspan="2">ID retention</td><td style="text-align:left">Control</td><td>0.972</td><td>0.986</td><td>0.985</td><td>0.992</td><td>0.996</td><td>0.945</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>0.967</td><td>0.983</td><td>0.880</td><td>0.903</td><td>0.875</td><td>0.820</td></tr>
+      <tr><td rowspan="2">New stable IDs minted</td><td style="text-align:left">Control</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>1</td><td>3</td><td>11</td><td>14</td><td>10</td><td>14</td></tr>
+      <tr><td rowspan="2">Median topic size</td><td style="text-align:left">Control</td><td>75</td><td>156</td><td>253</td><td>241</td><td>221</td><td>174</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>47</td><td>102</td><td>145</td><td>151</td><td>135</td><td>112</td></tr>
+      <tr><td rowspan="2">C_npmi, published set</td><td style="text-align:left">Control</td><td>+0.102</td><td>+0.103</td><td>+0.121</td><td>+0.109</td><td>+0.102</td><td>+0.078</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>+0.047</td><td>+0.071</td><td>+0.077</td><td>+0.078</td><td>+0.058</td><td>+0.065</td></tr>
+      <tr><td rowspan="2">C_v, all topics</td><td style="text-align:left">Control</td><td>0.455</td><td>0.479</td><td>0.512</td><td>0.506</td><td>0.498</td><td>0.473</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>0.398</td><td>0.427</td><td>0.442</td><td>0.455</td><td>0.440</td><td>0.441</td></tr>
+      <tr><td rowspan="2">Unassigned, holdout chunk</td><td style="text-align:left">Control</td><td>16.7%</td><td>3.0%</td><td>2.0%</td><td>2.7%</td><td>1.9%</td><td>2.7%</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>13.2%</td><td>3.2%</td><td>4.2%</td><td>3.1%</td><td>3.9%</td><td>4.4%</td></tr>
+      <tr><td rowspan="2">Inflation</td><td style="text-align:left">Control</td><td>1.70</td><td>1.68</td><td>1.74</td><td>1.76</td><td>1.78</td><td>1.75</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>1.74</td><td>1.73</td><td>1.62</td><td>1.63</td><td>1.60</td><td>1.60</td></tr>
+      <tr><td rowspan="2">Alerts (negative C_npmi)</td><td style="text-align:left">Control</td><td>0 (0)</td><td>4 (1)</td><td>7 (0)</td><td>3 (1)</td><td>14 (3)</td><td>4 (1)</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>2 (0)</td><td>5 (1)</td><td>8 (1)</td><td>3 (0)</td><td>16 (3)</td><td>5 (0)</td></tr>
+      <tr><td rowspan="2">Events found · recall</td><td style="text-align:left">Control</td><td>7 · .576</td><td>8 · .571</td><td>8 · .529</td><td>8 · .497</td><td>8 · .483</td><td>10 · .548</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>7 · .579</td><td>8 · .506</td><td>8 · .518</td><td>8 · .542</td><td>8 · .559</td><td>10 · .646</td></tr>
+      <tr><td rowspan="2">LLM calls (labels reused)</td><td style="text-align:left">Control</td><td>67 (372)</td><td>81 (386)</td><td>111 (393)</td><td>107 (437)</td><td>83 (491)</td><td>101 (503)</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>117 (480)</td><td>135 (503)</td><td>199 (448)</td><td>179 (461)</td><td>192 (446)</td><td>219 (418)</td></tr>
+      <tr><td rowspan="2">Compute excl. embedding (s)</td><td style="text-align:left">Control</td><td>58</td><td>75</td><td>108</td><td>106</td><td>108</td><td>114</td></tr>
+      <tr><td style="text-align:left">BERTopic</td><td>114</td><td>160</td><td>221</td><td>215</td><td>212</td><td>228</td></tr>
+    </tbody>
+  </table></div>
+  <p class="caption prose">Registry integrity held in every batch of both arms: 0 duplicate IDs, 0 phantom slots, 100% own-brand, 0 future <code>last_seen_at</code>. Control UMAP drift rose from 0.399 to 0.406 against the 0.45 refit threshold, so no refit fired. BERTopic has no manifold to drift.</p>
+
+  <h3>Whole stream</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Measure</th><th>Control</th><th>BERTopic</th><th class="note">Reading</th></tr></thead>
+    <tbody>
+      <tr><td>Wall clock (process)</td><td>54 m 38 s</td><td>19 m 52 s</td><td class="note">BERTopic read the control's cached chunk vectors</td></tr>
+      <tr><td>Embedding (6 new chunks)</td><td>2,667 s</td><td>0 s, reused</td><td class="note"></td></tr>
+      <tr><td>Compute excluding embedding</td><td>570 s</td><td class="worse">1,151 s</td><td class="note">2.0×</td></tr>
+      <tr><td>…of which UMAP + discovery clustering</td><td>94 load + 196 = 290 s</td><td class="worse">725 s</td><td class="note">2.5×: refit on the full window every batch</td></tr>
+      <tr><td>Cold-run equivalent</td><td>3,236 s</td><td class="worse">3,817 s</td><td class="note">+18%</td></tr>
+      <tr><td>Peak RAM</td><td>4.49 GiB</td><td>3.32 GiB</td><td class="note">Control peak includes the encoder</td></tr>
+      <tr><td>LLM calls · tokens</td><td>550 · 688k</td><td class="worse">1,041 · 1,294k</td><td class="note">1.9× the labelling spend</td></tr>
+      <tr><td>Label churn (topics in all 6 batches that changed label)</td><td>76 of 402 (19%)</td><td class="worse">110 of 327 (34%)</td><td class="note">Fewer survivors, and more of them relabelled</td></tr>
+      <tr><td>Alerts total · with negative C_npmi</td><td>32 · 6</td><td>39 · 5</td><td class="note"></td></tr>
+      <tr><td>Unclear labels (range)</td><td>33–49</td><td class="worse">47–70</td><td class="note"></td></tr>
+      <tr><td>Final batch events · recall · topics for 80%</td><td>10/10 · 0.548 · 3.1</td><td class="better">10/10 · 0.646 · 2.3</td><td class="note">BERTopic's one clear win</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout">
+    <strong>What to do with this.</strong>
+    <ul class="tight">
+      <li>The frozen per-brand manifold is what makes the stream cheap and stable. The control loads its manifold in 16 s and clusters in 18–40 s a batch; BERTopic refits and clusters in 81–142 s. Matching new topics against one fixed geometry is also what holds retention near 0.99.</li>
+      <li>BERTopic's refit every batch shows up as churn. Each batch it mints 10–14 new IDs, forces 60–110 capacity merges and relabels a third of the surviving topics. Dashboards would see topics appear, merge and rename.</li>
+      <li>Its lower inflation and better final-batch event grouping are worth chasing inside the current pipeline, not by switching frameworks. Both come from tighter centroids, which the <code>--secondary-margin</code> and split settings already control.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="report" id="r768s">
+  <div class="eyebrow">Report 4 · stream · pending</div>
+  <h2>768-dim across the 300k stream</h2>
+  <div class="prose">
+    <p>Starts after this page is published. Expect about 3–3.5 hours on this machine: the six chunks have to be embedded with the 768-dim encoder at about 34 segments a second. It will be added here, with the same per-batch tables, against both arms above.</p>
+  </div>
+</section>
+
+<footer class="prose">
+  <p>Raw numbers: <code>experiments/results/base_comparison.csv</code>, <code>stream_audit.csv</code>, <code>stream_summary_all.csv</code>, <code>stream_stage_timing_all.csv</code>. Per-run logs, <code>/usr/bin/time</code> output and machine load: <code>experiments/logs/</code>. Reproduce with <code>experiments/run_experiments.sh</code> and <code>experiments/compare_arms.py all</code>.</p>
+</footer>
+</div>
+<div id="tip" hidden></div>
+
+<script>
+(function () {
+  var ARMS = [
+    { key: "control", name: "Control", color: "var(--arm-control)" },
+    { key: "emb768", name: "768-dim", color: "var(--arm-768)" },
+    { key: "bertopic", name: "BERTopic", color: "var(--arm-bertopic)" }
+  ];
+  var NS = "http://www.w3.org/2000/svg";
+  var tip = document.getElementById("tip");
+  function el(name, attrs, parent) {
+    var n = document.createElementNS(NS, name);
+    for (var k in attrs) n.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(n);
+    return n;
+  }
+  function showTip(evt, html) {
+    tip.innerHTML = html; tip.hidden = false;
+    var x = Math.min(evt.clientX + 14, window.innerWidth - tip.offsetWidth - 8);
+    var y = Math.max(8, evt.clientY - tip.offsetHeight - 10);
+    tip.style.left = x + "px"; tip.style.top = y + "px";
+  }
+  function hideTip() { tip.hidden = true; }
+  function fmt(v, d) { return v.toLocaleString("en-US", { minimumFractionDigits: d || 0, maximumFractionDigits: d || 0 }); }
+  function legend(id, keys) {
+    var box = document.getElementById(id);
+    ARMS.filter(function (a) { return keys.indexOf(a.key) >= 0; }).forEach(function (a) {
+      var s = document.createElement("span");
+      s.innerHTML = '<span class="swatch" style="background:' + a.color + '"></span>' + a.name;
+      box.appendChild(s);
+    });
+  }
+
+  // ---- Base run: grouped horizontal bars, stage rows x arm bars
+  var stages = [
+    { name: "Embedding", v: { control: 1568.1, emb768: 5774.7, bertopic: 0 }, note: { bertopic: "reused control's vectors" } },
+    { name: "UMAP fit", v: { control: 117.0, emb768: 125.5, bertopic: 0 }, note: { bertopic: "inside BERTopic" } },
+    { name: "Discovery clustering", v: { control: 67.9, emb768: 79.1, bertopic: 119.7 } },
+    { name: "LLM labelling", v: { control: 58.7, emb768: 53.7, bertopic: 76.4 } },
+    { name: "Everything else", v: { control: 39.8, emb768: 42.3, bertopic: 50.1 } }
+  ];
+  function baseChart() {
+    var svg = document.getElementById("svg-base-time");
+    var W = 900, labelW = 150, valW = 150, barH = 12, gap = 3, groupGap = 16;
+    var plotW = W - labelW - valW;
+    var H = stages.length * (3 * barH + 2 * gap + groupGap) + 24;
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    var max = 6000;
+    var sx = function (v) { return labelW + (v / max) * plotW; };
+    [0, 1000, 2000, 3000, 4000, 5000, 6000].forEach(function (t) {
+      el("line", { x1: sx(t), x2: sx(t), y1: 0, y2: H - 20, "class": "grid" }, svg);
+      var tx = el("text", { x: sx(t), y: H - 6, "text-anchor": "middle" }, svg); tx.textContent = fmt(t) + (t === 6000 ? " s" : "");
+    });
+    var y = 4;
+    stages.forEach(function (st) {
+      var gy = y;
+      var lt = el("text", { x: 0, y: gy + (3 * barH + 2 * gap) / 2 + 4, "class": "lbl" }, svg); lt.textContent = st.name;
+      ARMS.forEach(function (a, i) {
+        var v = st.v[a.key], by = gy + i * (barH + gap);
+        var w = Math.max(0, sx(v) - sx(0));
+        if (w > 0) {
+          var r = el("rect", { x: sx(0), y: by, width: w, height: barH, rx: 2, fill: a.color }, svg);
+          r.style.fill = a.color;
+        }
+        var hit = el("rect", { x: labelW, y: by - 1, width: plotW + valW, height: barH + 2, fill: "transparent" }, svg);
+        var label = v > 0 ? fmt(v, v < 100 ? 1 : 0) + " s" : (st.note && st.note[a.key]) || "0 s";
+        var vt = el("text", { x: sx(0) + w + 6, y: by + barH - 2 }, svg); vt.textContent = label;
+        hit.addEventListener("mousemove", function (e) { showTip(e, "<b>" + a.name + "</b> · " + st.name + "<br>" + label); });
+        hit.addEventListener("mouseleave", hideTip);
+      });
+      y += 3 * barH + 2 * gap + groupGap;
+    });
+  }
+
+  // ---- Stream: small-multiple line charts
+  var S = {
+    live: { control: [365, 403, 441, 484, 516, 594], bertopic: [527, 578, 595, 597, 599, 629], min: 300, max: 700, ticks: [300, 400, 500, 600, 700], d: 0, cap: 600 },
+    ret: { control: [0.972, 0.986, 0.985, 0.992, 0.996, 0.945], bertopic: [0.967, 0.983, 0.880, 0.903, 0.875, 0.820], min: 0.8, max: 1.0, ticks: [0.8, 0.85, 0.9, 0.95, 1.0], d: 3 },
+    coh: { control: [0.102, 0.1026, 0.1206, 0.1086, 0.102, 0.0783], bertopic: [0.0471, 0.0709, 0.0769, 0.0779, 0.0583, 0.065], min: 0.04, max: 0.13, ticks: [0.04, 0.07, 0.10, 0.13], d: 3 },
+    cost: { control: [58.0, 75.3, 108.4, 106.1, 108.2, 113.9], bertopic: [114.0, 160.3, 221.0, 215.0, 212.1, 228.3], min: 0, max: 250, ticks: [0, 50, 100, 150, 200, 250], d: 0 }
+  };
+  function lineChart(id, spec) {
+    var svg = document.getElementById(id);
+    var W = 420, H = 210, L = 44, R = 64, T = 10, B = 26;
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    var sx = function (i) { return L + i * (W - L - R) / 5; };
+    var sy = function (v) { return T + (1 - (v - spec.min) / (spec.max - spec.min)) * (H - T - B); };
+    spec.ticks.forEach(function (t) {
+      el("line", { x1: L, x2: W - R, y1: sy(t), y2: sy(t), "class": "grid" }, svg);
+      var tx = el("text", { x: L - 6, y: sy(t) + 4, "text-anchor": "end" }, svg); tx.textContent = fmt(t, spec.d === 3 ? 2 : 0);
+    });
+    if (spec.cap) {
+      var cl = el("line", { x1: L, x2: W - R, y1: sy(spec.cap), y2: sy(spec.cap), stroke: "var(--ink-3)", "stroke-dasharray": "4 3", "stroke-width": 1 }, svg);
+      var ct = el("text", { x: L + 4, y: sy(spec.cap) - 5 }, svg); ct.textContent = "cap 600";
+    }
+    for (var i = 0; i < 6; i++) { var bt = el("text", { x: sx(i), y: H - 8, "text-anchor": "middle" }, svg); bt.textContent = "b" + (i + 1); }
+    var keys = ARMS.filter(function (a) { return spec[a.key]; });
+    // End labels, nudged apart when the two endpoints are close.
+    var ends = keys.map(function (a) { return { a: a, y: sy(spec[a.key][5]) }; }).sort(function (p, q) { return p.y - q.y; });
+    for (var k = 1; k < ends.length; k++) if (ends[k].y - ends[k - 1].y < 13) ends[k].y = ends[k - 1].y + 13;
+    keys.forEach(function (a) {
+      var pts = spec[a.key].map(function (v, i) { return sx(i) + "," + sy(v); }).join(" ");
+      var pl = el("polyline", { points: pts, fill: "none", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+      pl.style.stroke = a.color;
+      spec[a.key].forEach(function (v, i) {
+        var c = el("circle", { cx: sx(i), cy: sy(v), r: 4, "stroke-width": 2 }, svg);
+        c.style.fill = a.color; c.style.stroke = "var(--surface)";
+      });
+    });
+    ends.forEach(function (e) {
+      var t = el("text", { x: W - R + 8, y: e.y + 4, "class": "lbl" }, svg);
+      t.textContent = fmt(spec[e.a.key][5], spec.d);
+    });
+    // Crosshair hover per batch column.
+    var cross = el("line", { y1: T, y2: H - B, stroke: "var(--ink-3)", "stroke-width": 1, visibility: "hidden" }, svg);
+    for (var j = 0; j < 6; j++) (function (j) {
+      var hw = (W - L - R) / 5;
+      var hit = el("rect", { x: sx(j) - hw / 2, y: T, width: hw, height: H - T - B, fill: "transparent" }, svg);
+      hit.addEventListener("mousemove", function (e) {
+        cross.setAttribute("x1", sx(j)); cross.setAttribute("x2", sx(j)); cross.setAttribute("visibility", "visible");
+        showTip(e, "<b>Batch " + (j + 1) + "</b><br>" + keys.map(function (a) { return a.name + ": " + fmt(spec[a.key][j], spec.d); }).join("<br>"));
+      });
+      hit.addEventListener("mouseleave", function () { cross.setAttribute("visibility", "hidden"); hideTip(); });
+    })(j);
+  }
+
+  legend("legend-base", ["control", "emb768", "bertopic"]);
+  legend("legend-stream", ["control", "bertopic"]);
+  baseChart();
+  lineChart("svg-live", S.live);
+  lineChart("svg-ret", S.ret);
+  lineChart("svg-coh", S.coh);
+  lineChart("svg-cost", S.cost);
+})();
+</script>

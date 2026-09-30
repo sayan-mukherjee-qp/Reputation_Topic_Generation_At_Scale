@@ -1,0 +1,6 @@
+# Python 3.10+
+pandas>=2.2,<3
+numpy>=1.26,<3
+scikit-learn>=1.5,<2
+sentence-transformers>=3.0,<6
+matplotlib>=3.8,<4

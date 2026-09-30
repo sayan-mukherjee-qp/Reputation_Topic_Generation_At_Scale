@@ -1,0 +1,126 @@
+# Two-step run: a 200k base registry, then a 300k stream replayed in batches
+# against it. GPU memory is capped IN CODE (--max-vram-gb, default 2): Docker
+# hands a container whole GPUs and has no VRAM limit of its own.
+#
+#   docker compose build
+#   docker compose run --rm base      # 200k base run  -> ${OUT_DIR}/base_200k
+#   docker compose run --rm stream    # 300k stream    -> ${OUT_DIR}/stream_1..6
+#
+# Settings, exported in the shell or set in .env beside this file:
+#   CUDA_EXTRA   cu130 (driver >= 580) | cu126 (driver >= 560) | cpu
+#   CUDA_BASE    base image paired with CUDA_EXTRA (default
+#                nvidia/cuda:13.4.1-devel-ubuntu24.04; see the Dockerfile header)
+#   GPU_ID       which GPU to use (default 0)
+#   MAX_VRAM_GB  whole-process VRAM cap, what nvidia-smi shows (default 2)
+#   DATA_DIR     host dir holding twcs_subset_200k.csv and stream300/chunk_*.csv
+#   OUT_DIR      host dir for every output, the UMAP model and buffers
+#   CACHE_DIR    host dir for the embedding cache (default: the topic-cache volume)
+#
+# The same .env supplies the AI Router credentials (api_key=, base_url=,
+# use_case=) to the container at run time; it is never baked into the image.
+
+x-topics: &topics
+  build:
+    context: .
+    args:
+      CUDA_EXTRA: ${CUDA_EXTRA:-cu130}
+      CUDA_BASE: ${CUDA_BASE:-nvidia/cuda:13.4.1-devel-ubuntu24.04}
+      EMBEDDING_MODEL: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  image: reputation-topic-gpu-bertopic:${CUDA_EXTRA:-cu130}
+  volumes:
+    - ${DATA_DIR:-../data}:/data:ro
+    - ${OUT_DIR:-./out_docker}:/out
+    # Per-chunk embedding cache. It starts empty; within the stream it is what
+    # stops each chunk being re-embedded once per window it appears in.
+    # A named volume on Docker's own disk by default; set CACHE_DIR to a host
+    # path (e.g. /data/reputation_cache) when that disk is short on space.
+    - ${CACHE_DIR:-topic-cache}:/cache
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    # The model is baked into the image; never reach for the network for it.
+    HF_HUB_OFFLINE: "1"
+    TRANSFORMERS_OFFLINE: "1"
+  # Large embedding batches use shared memory for dataloader workers.
+  shm_size: "2gb"
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ["${GPU_ID:-0}"]
+            capabilities: [gpu]
+
+services:
+  # Ad-hoc: `docker compose run --rm topics /app/gpu_check.py`
+  topics:
+    <<: *topics
+    command: ["/app/reputation_topic_detection.py", "--help"]
+
+  # Step 1 -- the 200k base registry, discovered with BERTopic per brand pool.
+  base:
+    <<: *topics
+    command:
+      - /app/reputation_topic_detection.py
+      - /data/twcs_subset_200k.csv
+      - --out=/out/base_200k
+      - --device=cuda
+      - --max-vram-gb=${MAX_VRAM_GB:-2}
+      - --model=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+      - --min-similarity=0.50
+      - --min-cluster-size=30
+      - --min-samples=10
+      - --brand-scoped-assignment
+      - --merge-duplicate-topics
+      - --duplicate-similarity=0.92
+      - --flag-junk-topics
+      - --junk-coherence-veto=0.10
+      - --junk-coherence-min-size=30
+      - --micro-clusters
+      - --tweets-per-topic=-1
+      - --label-method=llm
+      - --label-llm-samples=10
+      - --label-llm-workers=12
+      # EXPERIMENT: BERTopic (library defaults) replaces frozen UMAP + HDBSCAN;
+      # the UMAP-space epsilon merge and Ward split are off.
+      - --reducer=bertopic
+      - --cluster-selection-epsilon=0
+      - --candidate-margin=0.05
+      - --split-max-size=0
+      - --alert-min-coherence=0.05
+      - --alert-min-size=250
+      - --residual-ack-ratio=0.40
+      - --event-recall
+      - --recover-unassigned
+      - --recover-match-existing
+      - --max-live-topics=600
+      - --consolidate-min-similarity=0.75
+      # Its own buffer: the base's leftovers run to 30 Nov and would leak the
+      # future into stream batch 1 (1-14 Oct).
+      - --buffer=/out/buf_base
+      - --embed-cache=/cache/embed
+
+  # Step 2 -- the 300k stream, 6 batches over a 3-chunk sliding window,
+  # matching against the base registry and minting EMERGING topics otherwise.
+  stream:
+    <<: *topics
+    command:
+      - /app/run_stream.py
+      - --base-run=/out/base_200k
+      - --chunks
+      - /data/stream300/chunk_1.csv
+      - /data/stream300/chunk_2.csv
+      - /data/stream300/chunk_3.csv
+      - /data/stream300/chunk_4.csv
+      - /data/stream300/chunk_5.csv
+      - /data/stream300/chunk_6.csv
+      - --window=3
+      - --out-prefix=/out/stream
+      - --buffer=/out/buf_stream
+      - --device=cuda
+      - --max-vram-gb=${MAX_VRAM_GB:-2}
+      - --embed-cache=/cache/embed
+
+volumes:
+  topic-cache:

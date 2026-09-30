@@ -1,0 +1,21 @@
+=== [base_control] 2026-09-30T12:24:26+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 30:55.98
+    Maximum resident set size (kbytes): 4600840
+=== [base_emb768] 2026-09-30T12:55:22+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 1:41:21
+    Maximum resident set size (kbytes): 8024468
+=== [base_bertopic] 2026-09-30T14:36:43+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 4:12.09
+    Maximum resident set size (kbytes): 3338796
+=== [stream_control] 2026-09-30T14:40:55+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 54:38.49
+    Maximum resident set size (kbytes): 4709336
+=== [stream_emb768] 2026-09-30T15:35:33+05:30 ===
+--- 2026-09-30T15:37:45+05:30 re-ordered on request: stream:bertopic then stream:emb768 (emb768 stream stopped 2 min in, nothing cached lost) ---
+=== [stream_bertopic] 2026-09-30T15:37:53+05:30 ===
+--- 2026-09-30T15:43:11+05:30 driver stopped before stream:emb768 on request (reports first); stream_bertopic left running ---
+=== [stream_bertopic] finished (driver was stopped; timing from logs/stream_bertopic.time) ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 19:51.74
+    Maximum resident set size (kbytes): 3480488
+--- 2026-09-30T16:05:02+05:30 reports published (https://claude.ai/artifact/D69fR4aYC1LX8kmPP7NTWd); starting stream:emb768 ---
+=== [stream_emb768] 2026-09-30T16:05:10+05:30 ===
