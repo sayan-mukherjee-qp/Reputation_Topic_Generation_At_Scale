@@ -131,7 +131,7 @@ footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
 <header class="top">
   <div class="eyebrow">Reputation topic generation · experiment log · 30 Sep 2026</div>
   <h1>768-dim embeddings and BERTopic against the current pipeline</h1>
-  <p class="lede prose">Two experimental copies of <code>reputation_topic_gpu</code>, each run on the 200k base corpus and then the 300k stream, compared with the unchanged code re-run on the same machine. All four runs are in.</p>
+  <p class="lede prose">Two experimental copies of <code>reputation_topic_gpu</code>, each run on the 200k base corpus and then the 300k stream, compared with the unchanged code re-run on the same machine. All four runs are in, plus a slice test of the tuned 768 copy (Report 5).</p>
   <div class="meta-row">
     <span>Intel Core 7 150U · 12 threads · 31 GiB · CPU only</span>
     <span>torch 2.14.0 · umap-learn 0.5.12 · sklearn 1.9.1 · bertopic 0.17.4</span>
@@ -146,6 +146,7 @@ footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
     <li><a href="#rbt">BERTopic · 200k</a><span class="status done">done</span></li>
     <li><a href="#rbts">BERTopic · 300k stream</a><span class="status done">done</span></li>
     <li><a href="#r768s">768-dim · 300k stream</a><span class="status done">done</span></li>
+    <li><a href="#rslice">Tuned 768 · 20k slice</a><span class="status done">done</span></li>
   </ol>
 </nav>
 
@@ -525,6 +526,115 @@ footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
       <li>This is the stronger test, and 768 passes it. The quality lead is small (+0.014 published C_npmi on average, about the noise floor) but it is ahead in every batch while matching the control's stability. 768 is the only change of the two worth pursuing.</li>
       <li>Retune the similarity thresholds in the 768 space before the next run. Inflation is the highest of any arm (1.83 by batch 6) and first-batch unassigned is lower. Both point to the 0.50 floor being looser in mpnet's space.</li>
       <li>The deciding question is cost on the real hardware. On this CPU the stream takes 3.7× as long. Next is the GPU run on the local laptop (the 768 copy is now uncapped for it); on GPU, embedding is a much smaller share of each batch.</li>
+    </ul>
+  </div>
+</section>
+
+
+<!-- ======================================================= Tuned 768 slice test -->
+<section class="report" id="rslice">
+  <div class="eyebrow">Report 5 · slice test · 20k base + 30k stream · 1 Oct 2026</div>
+  <h2>Tuning the 768-dim copy: what worked and what did not</h2>
+  <div class="prose">
+    <p><strong>The same-brand ID fix works in the 768 copy: zero brand switches in every stream batch. The threshold calibration does not help. Every tighter threshold set lowered coherence, so the 768 copy keeps its original thresholds for the 200k GPU run.</strong></p>
+    <p>The slice is <code>make_slice.py</code>'s 10% cut of the same data: <code>twcs_subset_20k.csv</code> (20,007 records) and <code>stream30/chunk_1..6</code> (29,627 records), every brand and the full 61-day window kept. Five versions ran a 20k base run and a six-batch stream, all with the fix and the other changes ported from the original.</p>
+  </div>
+
+  <h3>What changed in the 768 copy</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Change</th><th class="note">Source</th><th class="note">Status</th></tr></thead>
+    <tbody>
+      <tr><td>A topic can only inherit an ID from the same brand's previous topics</td><td class="note">ported from the original (<code>stabilize_topics</code>)</td><td class="note">kept: verified below</td></tr>
+      <tr><td>LLM failures report their last error and base URL</td><td class="note">ported from the original</td><td class="note">kept</td></tr>
+      <tr><td>Stream batch logs written live; <code>--echo</code></td><td class="note">ported from the original</td><td class="note">kept</td></tr>
+      <tr><td><code>make_slice.py</code>; <code>BASE_CSV</code> / <code>STREAM_DIR</code> / <code>BASE_RUN</code> in compose</td><td class="note">ported from the original</td><td class="note">kept (dashboard not ported)</td></tr>
+      <tr><td><code>--history-min-similarity</code> replaces a floor hard-coded at 0.50</td><td class="note">new</td><td class="note">kept, default 0.50 (no behaviour change)</td></tr>
+      <tr><td>Threshold sets selectable with <code>run_stream.py --thresholds</code></td><td class="note">new</td><td class="note">kept, default <code>original</code></td></tr>
+      <tr><td>Calibrated thresholds as default</td><td class="note">new</td><td class="note">tested, rejected</td></tr>
+      <tr><td><code>--secondary-margin 0.03</code></td><td class="note">tested</td><td class="note">rejected</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>The brand fix: verified</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Stream</th><th>Brand switches per batch (1–6)</th><th>ID retention</th></tr></thead>
+    <tbody>
+      <tr><td>Control, 300k, before the fix (30 Sep)</td><td class="worse">22 · 14 · 34 · 24 · 17 · 12</td><td>0.945–0.996</td></tr>
+      <tr><td>768-dim, 300k, before the fix (30 Sep)</td><td class="worse">24 · 15 · 34 · 31 · 16 · 13</td><td>0.974–0.991</td></tr>
+      <tr><td>Control, 30k slice, with the fix</td><td class="better">0 · 0 · 0 · 0 · 0 · 0</td><td>0.986–1.000</td></tr>
+      <tr><td>768-dim (all four versions), 30k slice, with the fix</td><td class="better">0 in all 24 batches</td><td>0.971–1.000</td></tr>
+    </tbody>
+  </table></div>
+  <p class="caption prose">A brand switch is a topic ID that exists in two consecutive batches under different brands. Every slice batch also had 0 duplicate IDs, 100% own-brand assignment and 0 mis-tagged topics.</p>
+
+  <h3>Threshold sets tested</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Version</th><th class="note">Thresholds</th></tr></thead>
+    <tbody>
+      <tr><td>Control</td><td class="note">384-dim MiniLM, original thresholds (the current code)</td></tr>
+      <tr><td>768 · original</td><td class="note">min 0.50 · candidate 0.55 · duplicate 0.92 · label-merge 0.70 · label-reuse 0.92 · consolidate 0.75</td></tr>
+      <tr><td>768 · floors only</td><td class="note">min and history floor 0.53; everything else original</td></tr>
+      <tr><td>768 · calibrated</td><td class="note">min 0.53 · history 0.53 · candidate 0.60 · duplicate 0.93 · label-merge 0.75 · label-reuse 0.93 · consolidate 0.80</td></tr>
+      <tr><td>768 · calibrated + margin</td><td class="note">calibrated, plus a second topic must score within 0.03 of the first</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Stream results (fixed stream30 corpus, mean of 6 batches)</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Measure</th><th>Control</th><th>768 · original</th><th>768 · floors</th><th>768 · calibrated</th><th>768 · +margin</th></tr></thead>
+    <tbody>
+      <tr><td>Published C_npmi</td><td>0.083</td><td class="better">0.097</td><td>0.078</td><td class="worse">0.068</td><td class="worse">0.053</td></tr>
+      <tr><td>Published C_v</td><td>0.529</td><td class="better">0.556</td><td>0.529</td><td>0.521</td><td>0.510</td></tr>
+      <tr><td>Event recall · topics for 80%</td><td>0.729 · 1.83</td><td class="better">0.748 · 1.72</td><td>0.741 · 1.84</td><td>0.724 · 1.86</td><td class="worse">0.629 · 2.45</td></tr>
+      <tr><td>Inflation (batch 6)</td><td>1.50 (1.58)</td><td>1.65 (1.70)</td><td>1.58 (1.64)</td><td>1.60 (1.68)</td><td class="better">1.17 (1.21)</td></tr>
+      <tr><td>Unassigned, holdout chunk</td><td>13.6%</td><td>9.9%</td><td>12.0%</td><td>12.5%</td><td>12.4%</td></tr>
+      <tr><td>Live topics at batch 6 · median size</td><td>159 · 47</td><td>138 · 86</td><td>159 · 61</td><td>174 · 59</td><td>175 · 41</td></tr>
+      <tr><td>Unclear labels (mean)</td><td>18.3</td><td>17.2</td><td>21.3</td><td>21.5</td><td>25.2</td></tr>
+      <tr><td>Alerts · with negative C_npmi</td><td>10 · 0</td><td>7 · 0</td><td>9 · 1</td><td>9 · 0</td><td>6 · 0</td></tr>
+      <tr><td>LLM calls · tokens</td><td>195 · 245k</td><td class="better">185 · 232k</td><td>217 · 274k</td><td>249 · 313k</td><td>268 · 337k</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="tbl"><table>
+    <thead><tr><th>Published C_npmi by batch</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th></tr></thead>
+    <tbody>
+      <tr><td>Control</td><td>0.086</td><td>0.119</td><td>0.088</td><td>0.063</td><td>0.077</td><td>0.064</td></tr>
+      <tr><td>768 · original</td><td>0.125</td><td>0.107</td><td>0.099</td><td>0.101</td><td>0.081</td><td>0.066</td></tr>
+      <tr><td>768 · floors</td><td>0.072</td><td>0.110</td><td>0.108</td><td>0.078</td><td>0.063</td><td>0.035</td></tr>
+      <tr><td>768 · calibrated</td><td>0.073</td><td>0.092</td><td>0.092</td><td>0.066</td><td>0.049</td><td>0.036</td></tr>
+      <tr><td>768 · +margin</td><td>0.050</td><td>0.060</td><td>0.073</td><td>0.062</td><td>0.039</td><td>0.035</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Base run (20k slice, fixed 20k corpus)</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Measure</th><th>Control</th><th>768 · original</th><th>768 · floors</th><th>768 · calibrated</th><th>768 · +margin</th></tr></thead>
+    <tbody>
+      <tr><td>Topics · median size</td><td>92 · 163</td><td>76 · 236</td><td>83 · 170</td><td>84 · 168</td><td>84 · 131</td></tr>
+      <tr><td>Unassigned · inflation</td><td>34.8% · 1.40</td><td>26.3% · 1.50</td><td>31.8% · 1.43</td><td>31.8% · 1.43</td><td>31.8% · 1.09</td></tr>
+      <tr><td>Published C_npmi · C_v</td><td>0.085 · 0.516</td><td class="better">0.105 · 0.560</td><td>0.101 · 0.554</td><td>0.099 · 0.547</td><td class="worse">0.074 · 0.520</td></tr>
+      <tr><td>Events · recall · topics for 80%</td><td>10/10 · 0.721 · 2.2</td><td>10/10 · 0.716 · 2.0</td><td>10/10 · 0.696 · 2.0</td><td>10/10 · 0.696 · 2.0</td><td>10/10 · 0.622 · 2.4</td></tr>
+      <tr><td>Embedding · rest of run</td><td>145 s · 95 s</td><td>572 s · 101 s</td><td colspan="3" style="text-align:left">cached · 101–103 s</td></tr>
+      <tr><td>Peak RAM</td><td>1.99 GiB</td><td>3.01 GiB</td><td colspan="3" style="text-align:left">2.20 GiB (no encoder pass)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Why calibration hurt</h3>
+  <div class="prose">
+    <p>The calibration matched how often each threshold <em>admits</em> a match in the two spaces. That made the 768 copy behave more like the control: unassigned rose from 26% toward 35%, inflation fell, and topic counts rose. But 768's advantage comes from admitting more. Its larger topics are what score well. Tighter floors leave more segments unassigned, candidate discovery turns them into new small topics (159–175 by batch 6 against 138), and small topics score at or below zero in every run so far. The calibrated candidate and merge thresholds (0.60, 0.75, 0.80) push the same way by keeping more of those small topics separate.</p>
+    <p>The secondary margin does what it was meant to, cutting inflation from 1.60 to 1.17, but costs event recall (0.724 → 0.629) and coherence, as it did in the earlier 384 ablation.</p>
+  </div>
+
+  <div class="callout warn">
+    <strong>How far to trust a slice.</strong> This is a 10% cut, so topic counts are 76–175 rather than 400–600, and each version ran once. Differences of 0.01–0.02 in C_npmi at this scale are within plausible noise. The ordering, though, is the same in the base run and the stream: original first among the 768 versions, calibrated and margin last. That consistency is what the decision rests on.
+  </div>
+
+  <div class="callout">
+    <strong>For the 200k GPU run.</strong>
+    <ul class="tight">
+      <li>The 768 copy is ready: original thresholds, the same-brand fix, no VRAM cap, live stream logs. The commands shared earlier still apply unchanged.</li>
+      <li>Double-counting stays the one open trade-off with 768 (1.65 vs 1.50 on the slice). If it matters more than coherence, <code>--thresholds floors</code> is the mildest fix (1.58) at a coherence cost.</li>
+      <li>On this CPU the 768 encoder ran at about 35 segments a second, 3.7–4.0× slower than MiniLM. The GPU run will show whether that ratio holds.</li>
     </ul>
   </div>
 </section>

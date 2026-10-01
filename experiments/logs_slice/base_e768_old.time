@@ -1,0 +1,23 @@
+	Command being timed: "/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu_bertopic/.venv/bin/python reputation_topic_detection.py /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/twcs_subset_20k.csv --out=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu_768/out/slice_e768_old/base_20k --model=sentence-transformers/paraphrase-multilingual-mpnet-base-v2 --device=cpu --min-cluster-size=30 --min-samples=10 --brand-scoped-assignment --merge-duplicate-topics --flag-junk-topics --junk-coherence-veto=0.10 --junk-coherence-min-size=30 --micro-clusters --tweets-per-topic=-1 --label-method=llm --label-llm-samples=10 --label-llm-workers=12 --reducer=umap --umap-components=5 --umap-neighbors=30 --umap-min-dist=0.0 --umap-per-brand --umap-reference-size=50000 --cluster-selection-epsilon=0.2 --candidate-margin=0.05 --split-max-size=2500 --alert-min-coherence=0.05 --alert-min-size=250 --residual-ack-ratio=0.40 --event-recall --recover-unassigned --recover-match-existing --max-live-topics=600 --min-similarity=0.50 --candidate-similarity=0.55 --duplicate-similarity=0.92 --split-max-child-similarity=0.92 --label-merge-similarity=0.70 --label-reuse-similarity=0.92 --consolidate-min-similarity=0.75 --secondary-margin=0 --umap-model=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu_768/out/slice_e768_old/models/umap_perbrand.pkl --buffer=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu_768/out/slice_e768_old/buf_base --embed-cache=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu_768/out/slice_cache"
+	User time (seconds): 5604.73
+	System time (seconds): 69.54
+	Percent of CPU this job got: 837%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 11:17.35
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 3159500
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 4982
+	Minor (reclaiming a frame) page faults: 16292233
+	Voluntary context switches: 30236
+	Involuntary context switches: 205949
+	Swaps: 0
+	File system inputs: 1749264
+	File system outputs: 810328
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

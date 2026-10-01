@@ -9,6 +9,26 @@
 > `--duplicate-similarity`, ...) were tuned in the 384-dim space and are
 > deliberately *not* retuned here.
 >
+> **Similarity thresholds (tested 1 Oct 2026).** mpnet scores the same text
+> higher than MiniLM, so three threshold sets were tested on a 20k base +
+> 30k stream slice (`experiments/slice_test.sh`, results in
+> `experiments/results_slice/`):
+>
+> | Set (`run_stream.py --thresholds`) | Stream published C_npmi | Inflation |
+> |---|---|---|
+> | **`original`**: MiniLM-tuned (min 0.50, candidate 0.55, ...) | **0.097** | 1.65 |
+> | `floors`: assignment floors 0.53 only | 0.078 | 1.58 |
+> | `calibrated`: every threshold quantile-matched to 768 | 0.068 | 1.60 |
+>
+> **`original` is the default** in `run_stream.py` and `docker-compose.yml`.
+> Tighter thresholds leave more segments unassigned, candidate discovery
+> turns them into more, smaller topics, and coherence drops. A new flag,
+> `--history-min-similarity` (default 0.50), replaces the floor that was
+> hard-coded in history re-assignment.
+>
+> **Same-brand ID inheritance** (ported from the original): a stream batch's
+> topic can only inherit an ID from the same brand's previous topics.
+>
 > **No VRAM cap by default.** Unlike the original (2 GiB), this copy defaults
 > to `--max-vram-gb 0` / `MAX_VRAM_GB=0` for a first run on a dedicated local
 > GPU: the embedding batch is the fixed CUDA default (256) and a block that

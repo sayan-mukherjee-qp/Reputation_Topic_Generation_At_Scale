@@ -1,0 +1,32 @@
+=== [base_control] 2026-10-01T13:41:12+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 4:03.81
+    Maximum resident set size (kbytes): 2088880
+=== [stream_control] 2026-10-01T13:45:15+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 9:00.96
+    Maximum resident set size (kbytes): 1875304
+=== [base_e768_old] 2026-10-01T13:54:16+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 11:17.35
+    Maximum resident set size (kbytes): 3159500
+=== [stream_e768_old] 2026-10-01T14:05:34+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 21:19.20
+    Maximum resident set size (kbytes): 2894904
+=== [base_e768_cal] 2026-10-01T14:26:53+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 1:47.53
+    Maximum resident set size (kbytes): 2309728
+=== [stream_e768_cal] 2026-10-01T14:28:40+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 5:18.51
+    Maximum resident set size (kbytes): 2127912
+=== [base_e768_margin] 2026-10-01T14:33:59+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 1:47.29
+    Maximum resident set size (kbytes): 2302468
+=== [stream_e768_margin] 2026-10-01T14:35:46+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 5:20.30
+    Maximum resident set size (kbytes): 2119936
+=== ALL DONE 2026-10-01T14:41:07+05:30 ===
+=== [base_e768_floors] 2026-10-01T14:42:13+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 1:45.42
+    Maximum resident set size (kbytes): 2306360
+=== [stream_e768_floors] 2026-10-01T14:43:59+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 6:53.64
+    Maximum resident set size (kbytes): 2122260
+=== ALL DONE 2026-10-01T14:50:52+05:30 ===

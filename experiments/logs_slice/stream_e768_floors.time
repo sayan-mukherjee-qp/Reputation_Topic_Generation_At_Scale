@@ -1,0 +1,23 @@
+	Command being timed: "/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu_bertopic/.venv/bin/python run_stream.py --base-run=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu_768/out/slice_e768_floors/base_20k --model=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu_768/out/slice_e768_floors/models/umap_perbrand.pkl --chunks /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_1.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_2.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_3.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_4.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_5.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_6.csv --window=3 --out-prefix=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu_768/out/slice_e768_floors/stream --buffer=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu_768/out/slice_e768_floors/buf_stream --device=cpu --embed-cache=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu_768/out/slice_cache --thresholds=floors --secondary-margin=0"
+	User time (seconds): 695.53
+	System time (seconds): 8.17
+	Percent of CPU this job got: 170%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 6:53.64
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 2122260
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 25
+	Minor (reclaiming a frame) page faults: 3199907
+	Voluntary context switches: 29146
+	Involuntary context switches: 223115
+	Swaps: 0
+	File system inputs: 2632
+	File system outputs: 200544
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

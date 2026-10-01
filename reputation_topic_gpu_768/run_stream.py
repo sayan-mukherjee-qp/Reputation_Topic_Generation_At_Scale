@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import pandas as pd
@@ -38,27 +40,57 @@ VENV = _VENV_PYTHON if _VENV_PYTHON.exists() else Path(sys.executable)
 
 COMMON = [
     "--model", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
-    "--min-similarity", "0.50", "--min-cluster-size", "30", "--min-samples", "10",
+    "--min-cluster-size", "30", "--min-samples", "10",
     "--brand-scoped-assignment",
-    "--merge-duplicate-topics", "--duplicate-similarity", "0.92",
+    "--merge-duplicate-topics",
     "--flag-junk-topics", "--junk-coherence-veto", "0.10", "--junk-coherence-min-size", "30",
     "--micro-clusters", "--tweets-per-topic", "-1",
     "--reducer", "umap", "--umap-components", "5", "--umap-neighbors", "30",
     "--umap-min-dist", "0.0", "--umap-per-brand",
     "--cluster-selection-epsilon", "0.2", "--candidate-margin", "0.05",
-    "--split-max-size", "2500", "--split-max-child-similarity", "0.92",
+    "--split-max-size", "2500",
     "--alert-min-coherence", "0.05", "--alert-min-size", "250",
     "--residual-ack-ratio", "0.40", "--event-recall",
     "--recover-unassigned", "--umap-drift-threshold", "0.45",
     "--umap-reference-size", "50000",
     "--carry-forward-topics", "--topic-max-age-days", "45",
     # out300w review, P1/P5: registry capacity and consolidation.
-    "--recover-match-existing", "--max-live-topics", "600",
-    "--consolidate-min-similarity", "0.75", "--retire-idle",
-    # --secondary-margin 0.05 cut inflation 1.82x -> 1.35x but cost event
-    # recall 0.508 -> 0.431 in a same-input batch-6 ablation; left off.
-    "--secondary-margin", "0",
+    "--recover-match-existing", "--max-live-topics", "600", "--retire-idle",
 ]
+
+# Similarity thresholds. mpnet-768 scores the same text higher than MiniLM
+# (0.50 admits 86% of segments to a first topic and 70% to a second, against
+# 81% and 58%), so "calibrated" re-derives each threshold by quantile-matching
+# the two encoders on the same 198k segments (experiments/calibrate_thresholds.py).
+# The 20k/30k slice test of 1 Oct 2026 (experiments/results_slice/) found the
+# ORIGINAL values best for 768 anyway: stream published-set C_npmi 0.097
+# original vs 0.078 floors-only vs 0.068 calibrated. Tighter thresholds leave
+# more segments unassigned, candidate discovery turns them into more, smaller
+# topics, and coherence falls. Original stays the default; the others are kept
+# for experiments (--thresholds).
+THRESHOLDS = {
+    "calibrated": [                    # every threshold quantile-matched to 768
+        "--min-similarity", "0.53", "--history-min-similarity", "0.53",
+        "--candidate-similarity", "0.60",
+        "--duplicate-similarity", "0.93", "--split-max-child-similarity", "0.93",
+        "--label-merge-similarity", "0.75", "--label-reuse-similarity", "0.93",
+        "--consolidate-min-similarity", "0.80",
+    ],
+    "floors": [                        # only the assignment floors calibrated
+        "--min-similarity", "0.53", "--history-min-similarity", "0.53",
+        "--candidate-similarity", "0.55",
+        "--duplicate-similarity", "0.92", "--split-max-child-similarity", "0.92",
+        "--label-merge-similarity", "0.70", "--label-reuse-similarity", "0.92",
+        "--consolidate-min-similarity", "0.75",
+    ],
+    "original": [                      # as tuned on MiniLM; best for 768 on the slice (default)
+        "--min-similarity", "0.50", "--history-min-similarity", "0.50",
+        "--candidate-similarity", "0.55",
+        "--duplicate-similarity", "0.92", "--split-max-child-similarity", "0.92",
+        "--label-merge-similarity", "0.70", "--label-reuse-similarity", "0.92",
+        "--consolidate-min-similarity", "0.75",
+    ],
+}
 
 
 def unassigned_rates(run_dir, assign, hold_csv=None):
@@ -184,6 +216,15 @@ def main() -> int:
                     help="Per-chunk embedding cache. Keep it on with --window > 1: it is what "
                          "stops each chunk being re-embedded once per window it appears in. "
                          "'' disables it")
+    ap.add_argument("--thresholds", default="original", choices=sorted(THRESHOLDS),
+                    help="Similarity thresholds: 'original' (MiniLM-tuned; best for 768 in the "
+                         "slice test, default), 'floors' (assignment floors 0.53 only), "
+                         "'calibrated' (every threshold quantile-matched to 768)")
+    ap.add_argument("--secondary-margin", default="0",
+                    help="A segment's second topic must score within this of its first. "
+                         "0 = any topic clearing the floor")
+    ap.add_argument("--echo", action="store_true",
+                    help="Also echo each batch's log to stdout as it runs, prefixed '  | '")
     a = ap.parse_args()
 
     Path(a.out_prefix).parent.mkdir(parents=True, exist_ok=True)
@@ -199,7 +240,8 @@ def main() -> int:
         history = a.chunks[max(0, i - a.window):i - 1]
         cmd = [str(VENV), str(SCRIPT), chunk, "--out", str(out),
                "--previous-topics", str(prev / "topics.json"),
-               "--umap-model", a.model, "--buffer", a.buffer] + COMMON + [
+               "--umap-model", a.model, "--buffer", a.buffer] + COMMON + THRESHOLDS[a.thresholds] + [
+               "--secondary-margin", str(a.secondary_margin),
                "--label-method", a.label_method,
                "--label-llm-samples", a.label_llm_samples,
                "--label-llm-workers", a.label_llm_workers]
@@ -215,13 +257,27 @@ def main() -> int:
             cmd += ["--max-vram-gb", str(a.max_vram_gb)]
         if a.batch_size:
             cmd += ["--batch-size", str(a.batch_size)]
-        print(f"=== chunk {i}: {Path(chunk).name} -> {out.name} ===", flush=True)
-        t0 = time.perf_counter()
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        # The batch log is written as the run goes, not after it, so it can be
+        # followed live (tail -f, or the dashboard). Opened before the banner
+        # below, so a reader that keys off the banner never sees a stale log.
+        log_path = Path(a.out_prefix).parent / f"stream_chunk{i}.log"
+        tail: deque[str] = deque(maxlen=40)
+        with log_path.open("w", encoding="utf-8") as log:
+            print(f"=== chunk {i}: {Path(chunk).name} -> {out.name} ===", flush=True)
+            t0 = time.perf_counter()
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, errors="replace",
+                                    env={**os.environ, "PYTHONUNBUFFERED": "1"})
+            for line in proc.stdout:
+                log.write(line)
+                log.flush()
+                tail.append(line)
+                if a.echo:
+                    print(f"  | {line}", end="", flush=True)
+            rc = proc.wait()
         dt = time.perf_counter() - t0
-        (Path(a.out_prefix).parent / f"stream_chunk{i}.log").write_text(r.stdout + r.stderr)
-        if r.returncode != 0:
-            print(f"  FAILED rc={r.returncode}\n{r.stderr[-2000:]}", flush=True)
+        if rc != 0:
+            print(f"  FAILED rc={rc}\n{''.join(tail)[-2000:]}", flush=True)
             return 1
         row = summarise(out, prev)
         row["runtime_s"] = round(dt, 1)

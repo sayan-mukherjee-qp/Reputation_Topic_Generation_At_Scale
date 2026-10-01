@@ -209,6 +209,8 @@ class AiRouterV1Client:
         with self._lock:
             st = dict(self.stats)
             lat = sorted(st.pop("latency_s"))
+            if getattr(self, "last_error", None):
+                st["last_error"] = self.last_error
         if lat:
             st["latency_mean_s"] = round(sum(lat) / len(lat), 3)
             st["latency_p95_s"] = round(lat[min(len(lat) - 1, int(0.95 * len(lat)))], 3)
@@ -288,8 +290,12 @@ class AiRouterV1Client:
         self._bump(calls=1)
         try:
             parsed = self._parse(self._run(TOPIC_LABEL_PROMPT, content))
-        except Exception:
+        except Exception as exc:
             self._bump(failures=1)
+            # Kept so a run that fell back to c-TF-IDF can say why, instead of
+            # only counting failures (a malformed base_url failed every call).
+            with self._lock:
+                self.last_error = f"{type(exc).__name__}: {exc}"[:300]
             return None
         if not parsed:
             self._bump(failures=1, parse_failures=1)

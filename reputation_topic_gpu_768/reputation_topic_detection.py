@@ -254,6 +254,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-samples", type=int, default=8)
     p.add_argument("--min-similarity", type=float, default=0.68)
     p.add_argument("--candidate-similarity", type=float, default=0.55)
+    p.add_argument("--history-min-similarity", type=float, default=0.50,
+                    help="Absolute floor for re-assigning the discovery history to topics "
+                         "(history uses max(this, --min-similarity - 0.10)). Like every "
+                         "similarity threshold it belongs to one embedding space: 0.50 was "
+                         "tuned for 384-dim MiniLM; the 768-dim mpnet equivalent is 0.53")
     p.add_argument("--max-segment-chars", type=int, default=450)
     p.add_argument("--max-segments-per-record", type=int, default=6)
     p.add_argument("--test-fraction", type=float, default=0.20,
@@ -2837,6 +2842,7 @@ def stabilize_topics(
     max_age_days: int = 0,
     window_end: Optional[pd.Timestamp] = None,
     label_reuse_similarity: float = 0.0,
+    brand_scoped: bool = False,
 ) -> Tuple[List[Topic], pd.DataFrame]:
     """Match newly discovered clusters to previous topics by original-space centroid similarity.
 
@@ -2867,6 +2873,16 @@ def stabilize_topics(
         cosine_sim(np.asarray(t.centroid, dtype=np.float32), prev_matrix)
         for t in new_topics
     ])
+    if brand_scoped:
+        # A topic belongs to the brand whose records formed it, so it can only
+        # inherit an ID (and its created_at and LLM label) from that brand's
+        # own previous topics. Unscoped, similar topics swapped identities
+        # across brands every batch -- 12 to 34 per batch on the 300k stream,
+        # e.g. T46 "Flight delays and baggage wait times" bouncing between
+        # Delta and AmericanAir.
+        new_b = np.asarray([str(t.brand) for t in new_topics])
+        prev_b = np.asarray([str(t.brand) for t in previous_topics])
+        sim_matrix = np.where(new_b[:, None] == prev_b[None, :], sim_matrix, -1.0)
 
     matched: Dict[int, int] = {}
     try:
@@ -3301,7 +3317,8 @@ def run(args: argparse.Namespace) -> int:
             max_age_days=args.topic_max_age_days,
             window_end=_win_end,
             label_reuse_similarity=(args.label_reuse_similarity
-                                    if args.label_method == "llm" else 0.0))
+                                    if args.label_method == "llm" else 0.0),
+            brand_scoped=args.brand_scoped_assignment)
         if not stability.empty:
             stability.to_csv(out_dir / "topic_stability_decisions.csv", index=False)
             print("\nCross-run topic stability decisions:")
@@ -3334,7 +3351,7 @@ def run(args: argparse.Namespace) -> int:
         train_segments,
         train_embeddings,
         topics,
-        similarity_threshold=max(0.50, args.min_similarity - 0.10),
+        similarity_threshold=max(args.history_min_similarity, args.min_similarity - 0.10),
         multi_topic=args.max_topics_per_segment > 1,
         max_topics_per_segment=args.max_topics_per_segment,
         brand_scoped=args.brand_scoped_assignment,
@@ -3821,6 +3838,10 @@ def run(args: argparse.Namespace) -> int:
                     else:
                         t.label, t.llm_substantive, t.label_source = label, sub, "llm"
                 llm_info["stats"] = client.summary()
+                if llm_info["stats"].get("failures"):
+                    print(f"Labelling: {llm_info['stats']['failures']:,} LLM call(s) failed; last error: "
+                          f"{llm_info['stats'].get('last_error', 'unknown')} (base_url={client.base})",
+                          file=sys.stderr)
             else:
                 from air2_client import Air2Client
                 client = Air2Client()
@@ -4220,6 +4241,11 @@ def run(args: argparse.Namespace) -> int:
             "candidate_similarity": float(args.candidate_similarity),
             "candidate_margin": float(args.candidate_margin),
             "duplicate_similarity": float(args.duplicate_similarity),
+            "history_min_similarity": float(args.history_min_similarity),
+            "label_merge_similarity": float(args.label_merge_similarity),
+            "label_reuse_similarity": float(args.label_reuse_similarity),
+            "consolidate_min_similarity": float(args.consolidate_min_similarity),
+            "secondary_margin": float(args.secondary_margin),
         },
         "umap_drift": (None if umap_projector is None or umap_projector.drift_frame().empty
                        else round(float(umap_projector.drift_frame()["mean_dist_to_reference"].mean()), 5)),
