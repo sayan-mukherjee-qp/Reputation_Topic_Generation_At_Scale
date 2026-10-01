@@ -7,10 +7,10 @@ import type { RunOverview, Topic } from "../lib/types";
 import { EMG, EST, isEmerging } from "./RunCharts";
 import { AlertChip, AXIS, LifecycleChip, TooltipBox } from "./ui";
 
-export function TopicDrawer({ run, topic, data, onClose }: {
-  run: string; topic: Topic; data: RunOverview; onClose: () => void;
+export function TopicDrawer({ dataset, run, topic, data, onClose, onViewRecords }: {
+  dataset: string; run: string; topic: Topic; data: RunOverview; onClose: () => void; onViewRecords: () => void;
 }) {
-  const samples = useFetch(() => api.samples(run, topic.topic_id), [run, topic.topic_id]);
+  const samples = useFetch(() => api.samples(dataset, run, topic.topic_id), [dataset, run, topic.topic_id]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
@@ -31,6 +31,7 @@ export function TopicDrawer({ run, topic, data, onClose }: {
             <div className="muted" style={{ fontSize: 12 }}>{topic.brand} · {topic.topic_id}</div>
             <h2 style={{ fontSize: 18, marginTop: 2 }}>{topic.label}</h2>
           </div>
+          <button className="btn btn-sm" onClick={onViewRecords}>View all records</button>
           <button className="btn btn-sm" onClick={onClose} aria-label="Close">Close</button>
         </div>
         <div className="row wrap">

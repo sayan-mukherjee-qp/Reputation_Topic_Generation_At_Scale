@@ -4,6 +4,7 @@ import { fmtDate, fmtDuration, fmtGrowth, fmtInt, fmtNum, fmtPct } from "../lib/
 import { useFetch } from "../lib/hooks";
 import type { EventRecall, Job, RunCard, RunOverview, Topic } from "../lib/types";
 import { RunTimeBreakdown, RunTrends } from "./AcrossRuns";
+import { RecordsView } from "./RecordsView";
 import { AlertStatus, DailyVolume, GrowthMap, isEmerging, StageTiming, TopicsByBrand } from "./RunCharts";
 import { TopicDrawer } from "./TopicDrawer";
 import { AlertChip, ChartCard, DataTable, LifecycleChip, Sparkline, StatusIcon, Tile } from "./ui";
@@ -124,10 +125,12 @@ function Events({ events }: { events: EventRecall[] }) {
 
 // -------------------------------------------------------------- main ---
 
-export function Results({ job }: { job: Job | null }) {
+export function Results({ job, dataset }: { job: Job | null; dataset: string }) {
+  // The live job only feeds this view when it runs on the dataset shown.
+  const liveJob = job?.dataset === dataset ? job : null;
   // Refetch the run list whenever the live job finishes another run.
-  const done = job?.completed_runs.length ?? 0;
-  const runs = useFetch(() => api.runs(), [done, job?.status]);
+  const done = liveJob?.completed_runs.length ?? 0;
+  const runs = useFetch(() => api.runs(dataset), [dataset, done, liveJob?.status]);
   const list = (runs.data?.runs ?? []).filter((r) => !r.error);
   const [picked, setPicked] = useState<string | null>(null);
   const [follow, setFollow] = useState(true);
@@ -135,19 +138,24 @@ export function Results({ job }: { job: Job | null }) {
   // Follow the newest run the live job produced, until the user picks a tab.
   useEffect(() => {
     if (!list.length) return;
-    const latest = job?.completed_runs[job.completed_runs.length - 1];
+    const latest = liveJob?.completed_runs[liveJob.completed_runs.length - 1];
     if (follow && latest && list.some((r) => r.name === latest)) setPicked(latest);
     else if (!picked || !list.some((r) => r.name === picked)) setPicked(list[0].name);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runs.data, done]);
+  useEffect(() => { setPicked(null); setFollow(true); }, [dataset]);
 
   const card = list.find((r) => r.name === picked) ?? null;
-  const overview = useFetch(() => (picked ? api.run(picked) : Promise.resolve(null)), [picked, card?.completed_at]);
+  const overview = useFetch(() => (picked && card ? api.run(dataset, picked) : Promise.resolve(null)),
+    [dataset, picked, card?.completed_at]);
   const data = overview.data;
 
   const [brand, setBrand] = useState("all");
   const [includeSuppressed, setIncludeSuppressed] = useState(false);
   const [topic, setTopic] = useState<Topic | null>(null);
+  const [view, setView] = useState<"overview" | "records">("overview");
+  const [recordTopic, setRecordTopic] = useState("");
+  useEffect(() => setRecordTopic(""), [dataset, picked]);
 
   const brands = useMemo(() => [...new Set((data?.topics ?? []).map((t) => t.brand))].sort(), [data]);
   const topics = useMemo(
@@ -155,7 +163,7 @@ export function Results({ job }: { job: Job | null }) {
     [data, brand, includeSuppressed],
   );
 
-  const regenerating = job?.status === "running" && card && !job.completed_runs.includes(card.name);
+  const regenerating = liveJob?.status === "running" && card && !liveJob.completed_runs.includes(card.name);
 
   if (runs.error) return <div className="section"><div className="empty">Could not load results: {runs.error}</div></div>;
   if (!list.length) {
@@ -199,12 +207,16 @@ export function Results({ job }: { job: Job | null }) {
       )}
 
       <div className="filters" role="group" aria-label="Filters">
+        <div className="seg" role="group" aria-label="View">
+          <button aria-pressed={view === "overview"} onClick={() => setView("overview")}>Overview</button>
+          <button aria-pressed={view === "records"} onClick={() => setView("records")}>Records</button>
+        </div>
         <label className="lbl" htmlFor="brand">Brand</label>
         <select id="brand" className="select" value={brand} onChange={(e) => setBrand(e.target.value)}>
           <option value="all">All brands</option>
           {brands.map((b) => <option key={b} value={b}>{b}</option>)}
         </select>
-        <label className="check" style={{ alignItems: "center" }}>
+        <label className="check" style={{ alignItems: "center", display: view === "records" ? "none" : undefined }}>
           <input type="checkbox" checked={includeSuppressed} onChange={(e) => setIncludeSuppressed(e.target.checked)} style={{ marginTop: 0 }} />
           Include suppressed topics <span className="muted">(junk, residual, campaign)</span>
         </label>
@@ -216,8 +228,23 @@ export function Results({ job }: { job: Job | null }) {
         )}
       </div>
 
+      {data?.meta.llm?.enabled && (data.meta.llm.failures ?? 0) > 0 && (
+        <div className="banner critical" role="alert" style={{ marginBottom: 12 }}>
+          <StatusIcon kind="warning" label="Warning" />
+          <span>
+            LLM labelling failed for {fmtInt(data.meta.llm.failed)} of {fmtInt(data.meta.llm.requested)} topics
+            ({fmtInt(data.meta.llm.failures)} failed calls), so those kept c-TF-IDF keyword labels.
+            {data.meta.llm.last_error && <> Last error: <span className="mono">{data.meta.llm.last_error}</span>.</>}
+            {data.meta.llm.base_url && <> Endpoint: <span className="mono">{data.meta.llm.base_url}</span>.</>}
+          </span>
+        </div>
+      )}
+
       {!data ? (
         <div className="empty">{overview.error ?? "Loading run…"}</div>
+      ) : view === "records" && picked ? (
+        <RecordsView dataset={dataset} run={picked} brand={brand} topics={data.topics}
+          topic={recordTopic} onTopic={setRecordTopic} onOpenTopic={setTopic} />
       ) : (
         <div className={overview.loading ? "dim" : undefined}>
           <div className="tiles">
@@ -269,7 +296,8 @@ export function Results({ job }: { job: Job | null }) {
       )}
 
       {topic && data && picked && (
-        <TopicDrawer run={picked} topic={topic} data={data} onClose={() => setTopic(null)} />
+        <TopicDrawer dataset={dataset} run={picked} topic={topic} data={data} onClose={() => setTopic(null)}
+          onViewRecords={() => { setRecordTopic(topic.topic_id); setView("records"); setTopic(null); }} />
       )}
     </div>
   );

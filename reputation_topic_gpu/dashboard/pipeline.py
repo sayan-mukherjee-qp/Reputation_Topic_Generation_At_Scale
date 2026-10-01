@@ -21,7 +21,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -53,6 +53,7 @@ class Settings:
     python: Path         # interpreter the pipeline runs under
     compose_file: Path
     device: str | None = None   # overrides the services' --device (e.g. cpu)
+    env: dict = field(default_factory=dict)   # compose variables set by the dataset
 
     @classmethod
     def resolve(cls, app_dir=None, data_dir=None, out_dir=None, cache_dir=None,
@@ -87,6 +88,74 @@ class Settings:
         return {"/app": self.app_dir, "/data": self.data_dir,
                 "/out": self.out_dir, "/cache": self.cache_dir}
 
+    def for_dataset(self, ds: "Dataset") -> "Settings":
+        """The same settings with this dataset's inputs and its own output dir."""
+        if ds.results_dir is not None:              # saved results: read them where they are
+            return replace(self, out_dir=ds.results_dir, env=ds.env)
+        return replace(self, out_dir=self.out_dir / ds.subdir if ds.subdir else self.out_dir,
+                       env=ds.env)
+
+
+@dataclass(frozen=True)
+class Dataset:
+    """A named input set: compose variables to override, and where its runs go.
+    A slice writes to its own OUT_DIR subfolder so it never overwrites full runs.
+
+    A dataset with `results_dir` is a set of runs produced elsewhere (another
+    machine, a downloaded archive): browsable like any other, never runnable."""
+    key: str
+    label: str
+    env: dict = field(default_factory=dict)
+    subdir: str = ""
+    results_dir: Path | None = None
+    group: str = ""                   # the UI tab it is shown under
+    description: str = ""
+
+    @property
+    def runnable(self) -> bool:
+        return self.results_dir is None
+
+
+# make_slice.py writes the slice inputs (1/10 of the base set and the stream).
+DATASETS = {
+    "slice": Dataset("slice", "Slice (20k)", {"BASE_CSV": "twcs_subset_20k.csv",
+                                              "STREAM_DIR": "stream30", "BASE_RUN": "base_20k"},
+                     "slice_20k"),
+    "full": Dataset("full", "Full (200k)"),
+}
+
+DATASETS_FILE = Path(__file__).resolve().parent / "datasets.local.json"
+
+
+def load_saved_datasets(path: Path = DATASETS_FILE) -> list[str]:
+    """Register saved result sets from a local JSON file (paths are per machine):
+
+        [{"key": "768_run1", "label": "Run 1", "group": "768-dim GPU runs",
+          "results_dir": "/abs/path/holding/base_and_stream_dirs",
+          "description": "optional"}]
+
+    Returns problems found, so a typo shows up in the log instead of a blank tab."""
+    if not path.exists():
+        return []
+    problems = []
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        return [f"{path.name}: not valid JSON ({exc})"]
+    for e in entries:
+        key, rd = str(e.get("key", "")).strip(), e.get("results_dir")
+        if not key or not rd or key in ("slice", "full"):
+            problems.append(f"{path.name}: entry needs a unique 'key' and a 'results_dir': {e}")
+            continue
+        p = Path(rd).expanduser()
+        p = p if p.is_absolute() else (path.parent / p).resolve()
+        if not p.is_dir():
+            problems.append(f"{path.name}: {key}: results_dir {p} does not exist")
+        DATASETS[key] = Dataset(key, str(e.get("label") or key), results_dir=p,
+                                group=str(e.get("group") or "Saved runs"),
+                                description=str(e.get("description") or ""))
+    return problems
+
 
 # ------------------------------------------------------- compose commands ---
 
@@ -106,7 +175,7 @@ def service_command(settings: Settings, service: str) -> list[str]:
     """The compose service's command, interpolated and mapped to this host."""
     spec = yaml.safe_load(settings.compose_file.read_text(encoding="utf-8"))
     raw = spec["services"][service]["command"]
-    env = {**read_dotenv(settings.compose_file.parent / ".env"), **os.environ}
+    env = {**read_dotenv(settings.compose_file.parent / ".env"), **os.environ, **settings.env}
     args = [_VAR.sub(lambda m: env.get(m[1]) or (m[2] or ""), str(a)) for a in raw]
     if settings.device:
         args = [f"--device={settings.device}" if a.startswith("--device=") else a for a in args]
@@ -292,8 +361,9 @@ class PipelineJob:
     _CHUNK_FAIL = re.compile(r"^\s+FAILED rc=(-?\d+)")
 
     def __init__(self, settings: Settings, include_stream: bool, fresh: bool,
-                 on_change: Callable[[], None]) -> None:
+                 on_change: Callable[[], None], dataset: str = "full") -> None:
         self.settings = settings
+        self.dataset = dataset
         self.include_stream = include_stream
         self.fresh = fresh
         self._on_change = on_change
@@ -523,6 +593,7 @@ class PipelineJob:
                 "status": self.status, "started_at": self.started_at,
                 "finished_at": self.finished_at, "error": self.error,
                 "include_stream": self.include_stream, "fresh": self.fresh,
+                "dataset": self.dataset, "out_dir": str(self.settings.out_dir),
                 "completed_runs": list(self.completed_runs),
                 "phases": phases, "log": list(self.log),
             }
@@ -541,11 +612,15 @@ class JobManager:
         with self._lock:
             self.version += 1
 
-    def start(self, include_stream: bool, fresh: bool) -> PipelineJob:
+    def start(self, include_stream: bool, fresh: bool, dataset: str = "full") -> PipelineJob:
+        ds = DATASETS[dataset]
+        if not ds.runnable:
+            raise RuntimeError(f"{ds.label} is a saved result set; it cannot be run from here")
         with self._lock:
             if self.job and self.job.status == "running":
                 raise RuntimeError("a run is already in progress")
-            self.job = PipelineJob(self.settings, include_stream, fresh, self.bump)
+            self.job = PipelineJob(self.settings.for_dataset(ds), include_stream, fresh,
+                                   self.bump, dataset=ds.key)
         self.job.start()
         self.bump()
         return self.job

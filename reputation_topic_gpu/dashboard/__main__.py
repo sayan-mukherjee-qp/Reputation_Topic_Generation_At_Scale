@@ -6,10 +6,11 @@ Paths default to the same DATA_DIR / OUT_DIR / CACHE_DIR docker compose uses
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import uvicorn
 
-from .pipeline import Settings
+from .pipeline import DATASETS_FILE, Settings, load_saved_datasets
 from .server import create_app
 
 
@@ -28,11 +29,24 @@ def main() -> None:
     ap.add_argument("--compose-file", help="Default: docker-compose.yml in --app-dir")
     ap.add_argument("--device", help="Override the services' --device=cuda, e.g. 'cpu' on a "
                                      "machine without a GPU, or 'cuda:1'")
+    ap.add_argument("--datasets-file", default=str(DATASETS_FILE),
+                    help="JSON list of saved result sets to show as extra tabs "
+                         "(default: dashboard/datasets.local.json, if present)")
     a = ap.parse_args()
+    for problem in load_saved_datasets(Path(a.datasets_file)):
+        print(f"warning: {problem}", flush=True)
     settings = Settings.resolve(a.app_dir, a.data_dir, a.out_dir, a.cache_dir,
                                 a.python, a.compose_file, a.device)
     print(f"Dashboard: http://{a.host}:{a.port}   (OUT_DIR={settings.out_dir})", flush=True)
-    uvicorn.run(create_app(settings), host=a.host, port=a.port, log_level="warning")
+    app = create_app(settings)
+    try:
+        # An open browser tab holds a live-updates (SSE) connection that never
+        # closes by itself; without a timeout, Ctrl+C would wait on it forever
+        # and the run would keep going with no server to stop it.
+        uvicorn.run(app, host=a.host, port=a.port, log_level="warning",
+                    timeout_graceful_shutdown=3)
+    finally:
+        app.state.jobs.stop()          # never leave a pipeline run orphaned
 
 
 if __name__ == "__main__":

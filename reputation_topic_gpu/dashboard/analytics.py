@@ -6,7 +6,9 @@ run finishing mid-session is picked up on the next request.
 """
 from __future__ import annotations
 
+import html
 import json
+import math
 import re
 import threading
 from pathlib import Path
@@ -212,6 +214,16 @@ def run_overview(run: Path) -> dict:
             "thresholds": meta.get("thresholds"),
             "llm_model": llm.get("model") if llm.get("enabled") else None,
             "llm_calls": (llm.get("stats") or {}).get("calls"),
+            "llm": {
+                "enabled": bool(llm.get("enabled")),
+                "requested": llm.get("requested"),
+                "labelled": llm.get("labelled"),
+                "failed": llm.get("failed"),
+                "reused": llm.get("reused"),
+                "failures": (llm.get("stats") or {}).get("failures"),
+                "last_error": (llm.get("stats") or {}).get("last_error") or llm.get("error"),
+                "base_url": llm.get("base_url"),
+            } if llm else None,
         },
         "topics": _records(topics),
         "series": _timeseries(run),
@@ -236,3 +248,119 @@ def topic_samples(run: Path, topic_id: str, limit: int = 12) -> list[str]:
 def stream_table(out_dir: Path) -> list[dict]:
     """stream_summary.csv from run_stream.py (written when the stream ends)."""
     return _csv_rows(out_dir / "stream_summary.csv")
+
+
+# --------------------------------------------------------------- records ---
+
+def _records_index(run: Path) -> pd.DataFrame:
+    """One row per record: time, brand, text and its topics (best match first).
+
+    A record's topics come from all of its segments; a segment can hold up to
+    two topics. Records that matched nothing keep an empty list. Built once per
+    run (it reads topic_assignments.csv, tens of MB on a full run), then cached.
+    """
+    def load(path: Path) -> pd.DataFrame:
+        recs = pd.read_csv(path, usecols=["tweet_id", "event_time", "brand", "text"],
+                           dtype={"tweet_id": str}, low_memory=False)
+        recs = recs.rename(columns={"tweet_id": "record_id"}).drop_duplicates("record_id")
+        asg = pd.read_csv(run / "topic_assignments.csv",
+                          usecols=["record_id", "topic_id", "similarity"],
+                          dtype={"record_id": str, "topic_id": str}, low_memory=False)
+        asg = (asg.dropna(subset=["topic_id"])
+                  .groupby(["record_id", "topic_id"], as_index=False)["similarity"].max()
+                  .sort_values(["record_id", "similarity"], ascending=[True, False]))
+        tags = asg.groupby("record_id").apply(
+            lambda g: list(zip(g["topic_id"], g["similarity"].round(3))), include_groups=False)
+        recs["topics"] = recs["record_id"].map(tags)
+        recs["topics"] = recs["topics"].apply(lambda v: v if isinstance(v, list) else [])
+        recs["_t"] = pd.to_datetime(recs["event_time"], errors="coerce", utc=True, format="mixed")
+        recs["_text_lc"] = recs["text"].fillna("").str.lower()
+        return recs.sort_values("_t", ascending=False, kind="stable").reset_index(drop=True)
+    return _cached(run / "normalized_records.csv", "records", load)
+
+
+def warm_records(run: Path) -> None:
+    try:
+        _records_index(run)
+    except (OSError, ValueError, KeyError):
+        pass                                    # a run mid-write; built on first request
+
+
+def records_page(run: Path, page: int = 1, page_size: int = 25, brand: str | None = None,
+                 topic: str | None = None, q: str | None = None, status: str = "all",
+                 oldest_first: bool = False) -> dict:
+    df = _records_index(run)
+    summary = _summary(run / "topic_hot_summary.csv")
+    emerging_ids = set(summary.loc[_is_emerging(summary["status_lifecycle"]), "topic_id"])
+
+    mask = pd.Series(True, index=df.index)
+    if brand:
+        mask &= df["brand"] == brand
+    if topic:
+        mask &= df["topics"].apply(lambda ts: any(t == topic for t, _ in ts))
+    if q:
+        mask &= df["_text_lc"].str.contains(q.lower(), regex=False)
+    if status == "assigned":
+        mask &= df["topics"].str.len() > 0
+    elif status == "unassigned":
+        mask &= df["topics"].str.len() == 0
+    elif status == "emerging":
+        mask &= df["topics"].apply(lambda ts: any(t in emerging_ids for t, _ in ts))
+    hit = df[mask]
+    if oldest_first:
+        hit = hit.iloc[::-1]
+
+    total = int(len(hit))
+    page_size = max(1, min(200, page_size))
+    pages = max(1, -(-total // page_size))
+    page = max(1, min(page, pages))
+    rows = hit.iloc[(page - 1) * page_size: page * page_size]
+
+    # Labels only for the topics on this page, so a page stays small.
+    ids = {t for ts in rows["topics"] for t, _ in ts}
+    meta = summary[summary["topic_id"].isin(ids)].set_index("topic_id")
+    topics = {tid: {"label": str(m["label"]), "lifecycle": str(m["status_lifecycle"]),
+                    "status": str(m["status"]), "suppressed": bool(m.get("suppressed", False))}
+              for tid, m in meta.iterrows()}
+    return {
+        "total": total, "page": page, "page_size": page_size, "pages": pages,
+        "all_records": int(len(df)),
+        "unassigned": int((df["topics"].str.len() == 0).sum()),
+        "records": [{"record_id": r.record_id, "event_time": r.event_time, "brand": r.brand,
+                     # Tweets arrive HTML-escaped ("&amp;"); show them as written.
+                     "text": html.unescape(r.text) if isinstance(r.text, str) else "",
+                     # Recovered (T_REC_*) assignments carry no similarity score.
+                     "topics": [{"topic_id": t, "similarity": None if s is None or math.isnan(s) else float(s)}
+                                for t, s in r.topics]}
+                    for r in rows.itertuples()],
+        "topics": topics,
+    }
+
+
+# ------------------------------------------------------------ saved sets ---
+
+def saved_set_info(out_dir: Path) -> dict:
+    """What a saved result set holds, read from its runs' metadata."""
+    runs = run_dirs(out_dir)
+    if not runs:
+        return {"available": False, "out_dir": str(out_dir),
+                "detail": f"no finished runs (run_metadata.json + topic_hot_summary.csv) in {out_dir}"}
+    metas = [_json(r / "run_metadata.json") for r in runs]
+    base = next((m for r, m in zip(runs, metas) if r.name.startswith("base")), metas[0])
+    llm = base.get("llm") or {}
+    batches = sorted(int(m[1]) for r in runs if (m := re.fullmatch(r".+_(\d+)", r.name))
+                     and not r.name.startswith("base"))
+    missing = [n for n in range(1, max(batches) + 1) if n not in batches] if batches else []
+    done = sorted(str(m.get("completed_at") or "") for m in metas if m.get("completed_at"))
+    return {
+        "available": True, "out_dir": str(out_dir), "detail": None,
+        "runs": len(runs), "stream_batches": batches, "missing_batches": missing,
+        "embedding_model": str(base.get("embedding_model") or "").split("/")[-1] or None,
+        "embedding_dim": base.get("embedding_dim"),
+        "embedding_device": base.get("embedding_device"),
+        "base_records": base.get("records"),
+        "labels": ("LLM" if (llm.get("labelled") or 0) > 0 else "keywords (c-TF-IDF)"),
+        "llm_model": llm.get("model") if (llm.get("labelled") or 0) > 0 else None,
+        "llm_error": llm.get("error") if not (llm.get("labelled") or 0) else None,
+        "completed_from": done[0] if done else None, "completed_to": done[-1] if done else None,
+    }

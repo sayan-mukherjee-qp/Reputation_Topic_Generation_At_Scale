@@ -224,7 +224,7 @@ function RunTimes({ job, now }: { job: Job; now: number }) {
   for (const p of job.phases) {
     if (p.key === "base") {
       const t = elapsed(p.started_at, p.finished_at, now);
-      if (t != null) rows.push({ run: "Base 200k", seconds: t, status: p.status });
+      if (t != null) rows.push({ run: "Base", seconds: t, status: p.status });
     }
     for (const b of p.batches ?? []) {
       const t = elapsed(b.started_at, b.finished_at, now);
@@ -318,7 +318,7 @@ export function LivePipeline({ job, serverNow }: { job: Job; serverNow: Now }) {
     <div className="section">
       <div className="section-head">
         <h2>Live pipeline</h2>
-        <p>Started {fmtEpoch(job.started_at)}{job.finished_at ? ` · finished ${fmtEpoch(job.finished_at)}` : ""}</p>
+        <p>{job.dataset === "slice" ? "Slice (20k)" : "Full (200k)"} · started {fmtEpoch(job.started_at)}{job.finished_at ? ` · finished ${fmtEpoch(job.finished_at)}` : ""}</p>
       </div>
       <section className="card pipeline-head">
         <div>

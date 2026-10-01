@@ -1,13 +1,52 @@
 import { ControlPanel } from "./components/ControlPanel";
 import { LivePipeline } from "./components/LivePipeline";
 import { Results } from "./components/Results";
+import { SavedRuns } from "./components/SavedRuns";
 import { StatusIcon } from "./components/ui";
-import { useJob, useTheme, type ThemeChoice } from "./lib/hooks";
+import { useEffect, useState } from "react";
+import { api } from "./lib/api";
+import { useFetch, useJob, useTheme, type ThemeChoice } from "./lib/hooks";
 
 export function App() {
   const { snap, setSnap, connected, serverNow } = useJob();
   const [theme, setTheme] = useTheme();
   const job = snap?.job ?? null;
+  const allDatasets = useFetch(() => api.datasets(), []).data?.datasets ?? [];
+  const datasets = allDatasets.filter((d) => d.runnable);
+  const groups = [...new Set(allDatasets.filter((d) => !d.runnable).map((d) => d.group))];
+  const [tab, setTab] = useState<string>(() => {
+    try {
+      return localStorage.getItem("rtm-tab") || "pipeline";
+    } catch {
+      return "pipeline";
+    }
+  });
+  const activeTab = tab === "pipeline" || groups.includes(tab) ? tab : "pipeline";
+  useEffect(() => {
+    try {
+      localStorage.setItem("rtm-tab", activeTab);
+    } catch {
+      /* storage unavailable */
+    }
+  }, [activeTab]);
+  const [dataset, setDataset] = useState<string>(() => {
+    try {
+      return localStorage.getItem("rtm-dataset") || "slice";
+    } catch {
+      return "slice";
+    }
+  });
+  // A running job pins the view to its own dataset.
+  useEffect(() => {
+    if (job?.status === "running" && job.dataset !== dataset) setDataset(job.dataset);
+  }, [job?.status, job?.dataset]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    try {
+      localStorage.setItem("rtm-dataset", dataset);
+    } catch {
+      /* storage unavailable */
+    }
+  }, [dataset]);
 
   return (
     <div className="shell">
@@ -36,9 +75,27 @@ export function App() {
         </div>
       </header>
 
-      <ControlPanel job={job} onSnapshot={setSnap} />
-      {job && <LivePipeline job={job} serverNow={serverNow} />}
-      <Results job={job} />
+      {groups.length > 0 && (
+        <nav className="top-tabs" role="tablist" aria-label="Views">
+          <button role="tab" aria-selected={activeTab === "pipeline"} onClick={() => setTab("pipeline")}>
+            Pipeline
+            {job?.status === "running" && <StatusIcon kind="running" label="Running" />}
+          </button>
+          {groups.map((g) => (
+            <button key={g} role="tab" aria-selected={activeTab === g} onClick={() => setTab(g)}>{g}</button>
+          ))}
+        </nav>
+      )}
+
+      {activeTab === "pipeline" ? (
+        <>
+          <ControlPanel job={job} onSnapshot={setSnap} datasets={datasets} dataset={dataset} onDataset={setDataset} />
+          {job && <LivePipeline job={job} serverNow={serverNow} />}
+          <Results job={job} dataset={dataset} />
+        </>
+      ) : (
+        <SavedRuns group={activeTab} datasets={allDatasets.filter((d) => !d.runnable && d.group === activeTab)} />
+      )}
     </div>
   );
 }

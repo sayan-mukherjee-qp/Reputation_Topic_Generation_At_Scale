@@ -13,6 +13,8 @@ Two files in this directory are **not tracked in git**. Both exceed GitHub's
 | `stream/stream_200k.csv` | 218,732 | 32 MB | tracked |
 | `stream/chunk_1..4.csv` | ~54k each | 7-9 MB | tracked |
 | `stream300/chunk_1..6.csv` | ~49.4k each (296,313 total) | 7-9 MB | tracked — the 300k stream `docker compose run stream` replays |
+| `twcs_subset_20k.csv` | 20,007 | 3 MB | quick-try slice, 1/10 of the 200k base (`make_slice.py`) |
+| `stream30/chunk_1..6.csv` | ~4.9k each (29,627 total) | <1 MB each | quick-try slice, 1/10 of `stream300` (`make_slice.py`) |
 
 The tracked subsets are what the pipeline is normally run against, so a fresh
 clone can run everything without rebuilding anything.
@@ -53,6 +55,13 @@ same window, ordered by event time and cut into four equal arrivals:
 
     cd ../reputation_topic_gpu
     python build_stream_batch.py      # -> ../data/stream/
+
+The quick-try slice (the dashboard's "Slice (20k)" dataset) keeps every tenth
+record per brand, in time order, from the 200k base and from each stream chunk,
+so the dates and brand mix match the full run at a tenth of the runtime:
+
+    cd ../reputation_topic_gpu
+    python make_slice.py              # -> ../data/twcs_subset_20k.csv, ../data/stream30/
 
 Note what this can and cannot test: the corpus ends 2017-12-03, so these are
 disjoint records from the same window delivered in time order, not a genuine

@@ -1,16 +1,20 @@
 """FastAPI backend: start/stop the pipeline, stream its progress, serve analytics.
 
+    GET  /api/datasets               the input sets a run can use (slice, full)
     GET  /api/preflight              inputs, interpreter, GPU, LLM key
     GET  /api/job                    current job snapshot
     GET  /api/job/events             the same snapshot as Server-Sent Events
-    POST /api/job/start              {"include_stream": true, "fresh": true}
+    POST /api/job/start              {"dataset": "slice", "include_stream": true, "fresh": true}
     POST /api/job/stop
     GET  /api/runs                   one card per finished run in OUT_DIR
     GET  /api/runs/{name}            topics, daily series, events for one run
     GET  /api/runs/{name}/topics/{id}  example tweets for one topic
+    GET  /api/runs/{name}/records    paginated records with their topics as tags
     GET  /api/stream                 stream_summary.csv
 
-Everything else serves the built React app from dashboard/web/dist.
+The preflight and runs endpoints take ?dataset=slice|full (default full); each
+dataset has its own inputs and output directory. Everything else serves the
+built React app from dashboard/web/dist.
 """
 from __future__ import annotations
 
@@ -19,22 +23,47 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import analytics
-from .pipeline import JobManager, Settings, arg_list, arg_value, read_dotenv, service_command
+from .pipeline import (DATASETS, JobManager, Settings, arg_list, arg_value, read_dotenv,
+                       service_command)
 
 WEB_DIST = Path(__file__).resolve().parent / "web" / "dist"
 
 
 class StartRequest(BaseModel):
+    dataset: str = "full"
     include_stream: bool = True
     fresh: bool = True
+
+
+_rows_cache: dict[str, tuple[float, int]] = {}
+_rows_lock = threading.Lock()
+
+
+def count_rows(path: Path) -> int | None:
+    """Records in a CSV (texts span lines, so parse it); cached on mtime."""
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    with _rows_lock:
+        hit = _rows_cache.get(str(path))
+    if hit and hit[0] == mtime:
+        return hit[1]
+    import pandas as pd
+    n = len(pd.read_csv(path, usecols=[0]))
+    with _rows_lock:
+        _rows_cache[str(path)] = (mtime, n)
+    return n
 
 
 def _gpu() -> dict:
@@ -59,15 +88,59 @@ def create_app(settings: Settings) -> FastAPI:
     jobs = JobManager(settings)
     app.state.jobs = jobs
 
-    def run_path(name: str) -> Path:
+    def scoped(dataset: str) -> Settings:
+        if dataset not in DATASETS:
+            raise HTTPException(404, f"unknown dataset {dataset!r}; one of {', '.join(DATASETS)}")
+        return settings.for_dataset(DATASETS[dataset])
+
+    def run_path(name: str, dataset: str) -> Path:
         # Only names the listing produced, so a request can never walk the disk.
-        for d in analytics.run_dirs(settings.out_dir):
+        out = scoped(dataset).out_dir
+        for d in analytics.run_dirs(out):
             if d.name == name:
                 return d
-        raise HTTPException(404, f"no finished run named {name!r} in {settings.out_dir}")
+        raise HTTPException(404, f"no finished run named {name!r} in {out}")
+
+    def inputs(s: Settings) -> dict:
+        base = service_command(s, "base")
+        stream = service_command(s, "stream")
+        base_csv = Path(next(a for a in base[2:] if not a.startswith("--")))
+        chunks = [Path(c) for c in arg_list(stream, "--chunks")]
+        return {"base_csv": base_csv, "chunks": chunks,
+                "base_rows": count_rows(base_csv) if base_csv.exists() else None,
+                "stream_rows": (sum(count_rows(c) or 0 for c in chunks)
+                                if chunks and all(c.exists() for c in chunks) else None)}
+
+    @app.get("/api/datasets")
+    def datasets() -> dict:
+        out = []
+        for ds in DATASETS.values():
+            s = settings.for_dataset(ds)
+            common = {"key": ds.key, "label": ds.label, "runnable": ds.runnable,
+                      "group": ds.group, "description": ds.description}
+            if not ds.runnable:
+                out.append({**common, **analytics.saved_set_info(s.out_dir)})
+                continue
+            try:
+                i = inputs(s)
+            except Exception as exc:              # noqa: BLE001 -- report, don't crash
+                out.append({**common, "available": False,
+                            "detail": f"{type(exc).__name__}: {exc}"})
+                continue
+            out.append({
+                **common, "available": i["base_csv"].exists(),
+                "base_csv": i["base_csv"].name, "base_rows": i["base_rows"],
+                "stream_chunks": len(i["chunks"]), "stream_rows": i["stream_rows"],
+                "stream_dir": i["chunks"][0].parent.name if i["chunks"] else None,
+                "out_dir": str(s.out_dir),
+                "detail": None if i["base_csv"].exists() else
+                f"{i['base_csv']} is missing" + (": run make_slice.py" if ds.key == "slice" else ""),
+            })
+        return {"datasets": out}
 
     @app.get("/api/preflight")
-    def preflight() -> dict:
+    def preflight(dataset: str = Query("full")) -> dict:
+        s = scoped(dataset)
         checks = []
 
         def add(key, label, ok, detail, level="error"):
@@ -77,13 +150,16 @@ def create_app(settings: Settings) -> FastAPI:
         add("compose", "Compose file", settings.compose_file.exists(), str(settings.compose_file))
         add("python", "Pipeline interpreter", settings.python.exists(), str(settings.python))
         try:
-            base = service_command(settings, "base")
-            stream = service_command(settings, "stream")
+            base = service_command(s, "base")
+            stream = service_command(s, "stream")
         except Exception as exc:                  # noqa: BLE001 -- report, don't crash
             add("commands", "Pipeline commands", False, f"{type(exc).__name__}: {exc}")
-            return {"checks": checks, "settings": _settings_view(settings)}
+            return {"checks": checks, "settings": _settings_view(s)}
         base_csv = Path(next(a for a in base[2:] if not a.startswith("--")))
-        add("base_input", "Base input (200k)", base_csv.exists(), str(base_csv))
+        rows = count_rows(base_csv) if base_csv.exists() else None
+        add("base_input", "Base input" + (f" ({rows:,} records)" if rows else ""),
+            base_csv.exists(), str(base_csv) if base_csv.exists() else
+            f"{base_csv} is missing" + (" -- run make_slice.py" if dataset == "slice" else ""))
         chunks = [Path(c) for c in arg_list(stream, "--chunks")]
         missing = [c.name for c in chunks if not c.exists()]
         add("stream_input", f"Stream chunks ({len(chunks)})", not missing,
@@ -91,11 +167,11 @@ def create_app(settings: Settings) -> FastAPI:
             else (str(chunks[0].parent) if chunks else "no --chunks in the stream service"),
             level="warning")
         try:
-            settings.out_dir.mkdir(parents=True, exist_ok=True)
-            writable = os.access(settings.out_dir, os.W_OK)
+            s.out_dir.mkdir(parents=True, exist_ok=True)
+            writable = os.access(s.out_dir, os.W_OK)
         except OSError:
             writable = False
-        add("out_dir", "Output directory writable", writable, str(settings.out_dir))
+        add("out_dir", "Output directory writable", writable, str(s.out_dir))
         gpu = _gpu()
         device = arg_value(base, "--device") or "auto"
         if device.startswith("cuda") and not gpu["ok"]:
@@ -108,7 +184,17 @@ def create_app(settings: Settings) -> FastAPI:
         add("llm", "LLM labelling key", key,
             "AI Router key found" if key else
             "no api_key in .env: topics fall back to c-TF-IDF keyword labels", level="warning")
-        return {"checks": checks, "settings": _settings_view(settings)}
+        if arg_value(base, "--label-method") == "llm":
+            url = env.get("AIROUTER_BASE_URL") or env.get("base_url") or "https://airouter-api.questionpro.com"
+            u = urlparse(url)
+            bad = (u.scheme not in ("http", "https") or not u.netloc or "#" in url
+                   or any(ch.isspace() for ch in url))
+            # A malformed URL fails every labelling call and the run quietly
+            # falls back to keyword labels, so it blocks the start.
+            add("llm_url", "LLM endpoint", not bad,
+                f"base_url={url!r} is malformed (a comment or text merged into the line?); "
+                "every labelling call would fail. Fix it in .env." if bad else url)
+        return {"checks": checks, "settings": _settings_view(s)}
 
     @app.get("/api/job")
     def job() -> dict:
@@ -134,7 +220,8 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/api/job/start")
     def start(req: StartRequest) -> dict:
         try:
-            jobs.start(req.include_stream, req.fresh)
+            scoped(req.dataset)
+            jobs.start(req.include_stream, req.fresh, req.dataset)
         except RuntimeError as exc:
             raise HTTPException(409, str(exc))
         return jobs.snapshot()
@@ -146,21 +233,35 @@ def create_app(settings: Settings) -> FastAPI:
         return jobs.snapshot()
 
     @app.get("/api/runs")
-    def runs() -> dict:
-        return {"out_dir": str(settings.out_dir), "runs": analytics.list_runs(settings.out_dir)}
+    def runs(dataset: str = Query("full")) -> dict:
+        out = scoped(dataset).out_dir
+        return {"out_dir": str(out), "runs": analytics.list_runs(out)}
 
     @app.get("/api/runs/{name}")
-    def run(name: str) -> dict:
-        return analytics.run_overview(run_path(name))
+    def run(name: str, dataset: str = Query("full")) -> dict:
+        path = run_path(name, dataset)
+        # Warm the records index (seconds on a full run) before anyone opens Records.
+        threading.Thread(target=analytics.warm_records, args=(path,), daemon=True).start()
+        return analytics.run_overview(path)
 
     @app.get("/api/runs/{name}/topics/{topic_id}")
-    def topic(name: str, topic_id: str) -> dict:
+    def topic(name: str, topic_id: str, dataset: str = Query("full")) -> dict:
         return {"topic_id": topic_id,
-                "samples": analytics.topic_samples(run_path(name), topic_id)}
+                "samples": analytics.topic_samples(run_path(name, dataset), topic_id)}
+
+    @app.get("/api/runs/{name}/records")
+    def records(name: str, dataset: str = Query("full"), page: int = Query(1, ge=1),
+                page_size: int = Query(25, ge=1, le=200), brand: str | None = None,
+                topic: str | None = None, q: str | None = None,
+                status: str = Query("all", pattern="^(all|assigned|unassigned|emerging)$"),
+                order: str = Query("newest", pattern="^(newest|oldest)$")) -> dict:
+        return analytics.records_page(run_path(name, dataset), page, page_size, brand or None,
+                                      topic or None, (q or "").strip() or None, status,
+                                      oldest_first=order == "oldest")
 
     @app.get("/api/stream")
-    def stream() -> dict:
-        return {"rows": analytics.stream_table(settings.out_dir)}
+    def stream(dataset: str = Query("full")) -> dict:
+        return {"rows": analytics.stream_table(scoped(dataset).out_dir)}
 
     @app.on_event("shutdown")
     def _stop_job() -> None:
@@ -172,6 +273,11 @@ def create_app(settings: Settings) -> FastAPI:
 
         @app.get("/{path:path}", include_in_schema=False)
         def spa(path: str):
+            # The app shell is for page routes only. An unknown API route must
+            # fail as JSON, or the UI would try to parse this HTML as data.
+            if path == "api" or path.startswith("api/"):
+                raise HTTPException(404, f"no API route /{path} (is the server older than the UI? "
+                                         "restart the dashboard)")
             f = (WEB_DIST / path).resolve()
             if path and f.is_file() and WEB_DIST in f.parents:
                 return FileResponse(f)

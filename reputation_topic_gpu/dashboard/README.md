@@ -59,6 +59,28 @@ cd dashboard/web && npm run dev               # UI on :5173, /api proxied to :87
 
 `DASHBOARD_API=http://host:port npm run dev` points the proxy elsewhere.
 
+## Datasets
+
+The **Dataset** switch picks the inputs for a run and which results you browse:
+
+| Dataset | Base | Stream | Outputs |
+|---|---|---|---|
+| Slice (20k) | `twcs_subset_20k.csv` (20,007) | `stream30/` (29,627) | `$OUT_DIR/slice_20k/` |
+| Full (200k) | `twcs_subset_200k.csv` (200,075) | `stream300/` (296,313) | `$OUT_DIR/` |
+
+The slice is a 1/10 sample with the same dates and brand mix (`python
+make_slice.py` rebuilds it), for trying the flow in minutes instead of an hour
+on CPU. It has its own output folder, buffers and UMAP model, so it never
+touches full-run results. It works by setting the compose variables
+`BASE_CSV`, `STREAM_DIR` and `BASE_RUN`, which also work without the dashboard:
+
+```bash
+BASE_CSV=twcs_subset_20k.csv BASE_RUN=base_20k OUT_DIR=./out/slice_20k docker compose run --rm base
+```
+
+With 1/10 the records, fewer topics clear the alert floors (`--alert-min-size=250`),
+so expect fewer HOT/TRENDING alerts than a full run.
+
 ## What the options do
 
 - **Continue into the 300k stream:** after the base run succeeds, runs the
@@ -76,13 +98,15 @@ phase is written to `$OUT_DIR/dashboard_logs/`.
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/preflight` | inputs, interpreter, GPU, LLM key |
+| GET | `/api/datasets` | the slice and full input sets, with record counts |
+| GET | `/api/preflight` | inputs, interpreter, GPU, LLM key and endpoint |
 | GET | `/api/job` · `/api/job/events` | job snapshot, and the same as Server-Sent Events |
 | POST | `/api/job/start` | `{"include_stream": true, "fresh": true}` |
 | POST | `/api/job/stop` | |
 | GET | `/api/runs` | one card per finished run in `OUT_DIR` |
 | GET | `/api/runs/{name}` | topics, daily series, event recall for one run |
 | GET | `/api/runs/{name}/topics/{id}` | example records for one topic |
+| GET | `/api/runs/{name}/records` | records with their topics as tags; `page`, `page_size` (≤200), `brand`, `topic`, `q`, `status` (all/assigned/unassigned/emerging), `order` (newest/oldest) |
 | GET | `/api/stream` | `stream_summary.csv` |
 
 Interactive docs: `/api/docs`.

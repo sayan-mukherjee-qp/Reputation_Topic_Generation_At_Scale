@@ -18,6 +18,11 @@
 #   OUT_DIR      host dir for every output, the UMAP model and buffers
 #   CACHE_DIR    host dir for the embedding cache (default: the topic-cache volume)
 #   DASHBOARD_PORT  host port for the dashboard (default 8765, bound to 127.0.0.1)
+#   BASE_CSV     base input under DATA_DIR (default twcs_subset_200k.csv)
+#   STREAM_DIR   stream chunk dir under DATA_DIR (default stream300)
+#   BASE_RUN     base run dir under OUT_DIR (default base_200k)
+#   (make_slice.py writes a 20k/30k quick-try slice: BASE_CSV=twcs_subset_20k.csv
+#    STREAM_DIR=stream30 BASE_RUN=base_20k; the dashboard offers it as a dataset)
 #
 # The same .env supplies the AI Router credentials (api_key=, base_url=,
 # use_case=) to the container at run time; it is never baked into the image.
@@ -67,8 +72,8 @@ services:
     <<: *topics
     command:
       - /app/reputation_topic_detection.py
-      - /data/twcs_subset_200k.csv
-      - --out=/out/base_200k
+      - /data/${BASE_CSV:-twcs_subset_200k.csv}
+      - --out=/out/${BASE_RUN:-base_200k}
       - --device=cuda
       - --max-vram-gb=${MAX_VRAM_GB:-2}
       - --model=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
@@ -116,15 +121,15 @@ services:
     <<: *topics
     command:
       - /app/run_stream.py
-      - --base-run=/out/base_200k
+      - --base-run=/out/${BASE_RUN:-base_200k}
       - --model=/out/models/umap_v5_perbrand.pkl
       - --chunks
-      - /data/stream300/chunk_1.csv
-      - /data/stream300/chunk_2.csv
-      - /data/stream300/chunk_3.csv
-      - /data/stream300/chunk_4.csv
-      - /data/stream300/chunk_5.csv
-      - /data/stream300/chunk_6.csv
+      - /data/${STREAM_DIR:-stream300}/chunk_1.csv
+      - /data/${STREAM_DIR:-stream300}/chunk_2.csv
+      - /data/${STREAM_DIR:-stream300}/chunk_3.csv
+      - /data/${STREAM_DIR:-stream300}/chunk_4.csv
+      - /data/${STREAM_DIR:-stream300}/chunk_5.csv
+      - /data/${STREAM_DIR:-stream300}/chunk_6.csv
       - --window=3
       - --out-prefix=/out/stream
       - --buffer=/out/buf_stream
