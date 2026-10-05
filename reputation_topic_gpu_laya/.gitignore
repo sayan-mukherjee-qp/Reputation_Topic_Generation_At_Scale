@@ -1,0 +1,13 @@
+.venv/
+out/
+buf*/
+out*/
+embed_cache/
+__pycache__/
+*.pyc
+.env
+.smoke/
+models/*.pkl
+.work/
+# Per-machine dashboard result paths
+dashboard/datasets.local.json
