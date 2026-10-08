@@ -52,13 +52,17 @@ MENTION_RE = re.compile(r"(?<!\w)@\w+")
 WHITESPACE_RE = re.compile(r"\s+")
 MULTI_PUNCT_RE = re.compile(r"([!?.,])\1{2,}")
 
-DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
 # Peak GPU memory the embedding stage may touch, in GiB. Nothing else in the
 # pipeline uses the GPU -- UMAP is umap-learn/numba and HDBSCAN is sklearn, both
 # CPU -- so capping this one stage caps the whole run. The default suits a small
 # shared cloud GPU; raise it with --max-vram-gb when there is more to spend.
 DEFAULT_MAX_VRAM_GB = 2.0
+
+# EXPERIMENT (Laya copy): how a stream batch files incoming records. The cold
+# start (no --previous-topics) is always the normal pipeline.
+DEFAULT_MATCHER = "laya"
 
 # Share of the budget handed to activations. The remainder absorbs allocator
 # fragmentation and the transient spike inside a transformer layer, neither of
@@ -188,12 +192,6 @@ class Topic:
     suppressed: Optional[bool] = None
     suppress_reason: Optional[str] = None
     alert_suppressed_reason: Optional[str] = None
-    # P8 (opt-in). IDs this topic absorbed in merges, so an old ID still
-    # resolves; and a parent group for close same-brand siblings left unmerged.
-    aliases: Optional[List[str]] = None
-    group_id: Optional[str] = None
-    group_label: Optional[str] = None
-    group_size: Optional[int] = None
     tweets: Optional[List[str]] = None
 
 
@@ -253,6 +251,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--brand-col", default="brand")
     p.add_argument("--id-col", default="tweet_id")
     p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--embed-prompt", default="auto",
+                   help="Text prefix the encoder expects, e.g. 'query: ' for multilingual-e5. "
+                        "'auto' (default) looks the model up in ENCODER_SETTINGS; '' disables")
+    p.add_argument("--trust-remote-code", default=None, action="store_true",
+                   help="Allow the model's own modelling code (needed by gte-multilingual and "
+                        "nomic-embed-v2). Default: on for models listed in ENCODER_SETTINGS")
     p.add_argument("--min-cluster-size", type=int, default=20)
     p.add_argument("--min-samples", type=int, default=8)
     p.add_argument("--min-similarity", type=float, default=0.68)
@@ -312,43 +316,6 @@ def parse_args() -> argparse.Namespace:
                     help="Merge same-brand topics that the LLM gave the identical label when "
                          "their centroids are at least this similar. Catches over-splits the "
                          "--duplicate-similarity pass misses. 0 disables")
-    # P8. Near-duplicate same-brand topics. Everything below is OFF by default.
-    p.add_argument("--label-merge-mode", default="exact", choices=["exact", "wordset", "semantic"],
-                    help="How --label-merge-similarity compares labels. 'exact': the same string "
-                         "(default). 'wordset': the same content words in any order. 'semantic': "
-                         "label embeddings at least --label-merge-text-similarity apart")
-    p.add_argument("--label-merge-text-similarity", type=float, default=0.90,
-                    help="Label-embedding cosine for --label-merge-mode semantic")
-    p.add_argument("--overlap-merge-ratio", type=float, default=0.0,
-                    help="Merge same-brand topics when at least this share of the smaller one's "
-                         "records also sit on the other (and centroids clear "
-                         "--overlap-merge-similarity). 0 disables")
-    p.add_argument("--overlap-merge-similarity", type=float, default=0.70)
-    p.add_argument("--llm-merge-review", action="store_true",
-                    help="Ask the LLM whether close same-brand topic pairs are the same issue, "
-                         "and merge the ones it calls the same")
-    p.add_argument("--review-min-similarity", type=float, default=0.70,
-                    help="Centroid similarity a pair needs before the LLM reviews it")
-    p.add_argument("--review-min-confidence", type=float, default=0.70,
-                    help="Merge only when the LLM says 'same' with at least this confidence")
-    p.add_argument("--review-max-pairs", type=int, default=60,
-                    help="Most pairs reviewed per run, most similar first")
-    p.add_argument("--disambiguate-labels", action="store_true",
-                    help="Relabel same-brand topic pairs whose labels collide but which stay "
-                         "separate, asking the LLM for names that tell them apart")
-    p.add_argument("--disambiguate-similarity", type=float, default=0.85,
-                    help="Label-embedding cosine at which two labels count as colliding")
-    p.add_argument("--topic-groups", action="store_true",
-                    help="Group close same-brand topics under a parent (no merging): every pair "
-                         "in a group has centroid >= --group-min-similarity")
-    p.add_argument("--group-min-similarity", type=float, default=0.75)
-    p.add_argument("--merge-max-aliases", type=int, default=0,
-                    help="With --keep-aliases: a topic already holding this many absorbed IDs "
-                         "absorbs no more, so one topic cannot snowball across stream batches "
-                         "(0 = no cap)")
-    p.add_argument("--keep-aliases", action="store_true",
-                    help="Record merged-away topic IDs as aliases of the survivor and carry them "
-                         "across stream batches, so an old ID still resolves")
     p.add_argument("--history-csv", nargs="*", default=None,
                     help="Sliding window: earlier chunk CSVs prepended as discovery history. "
                          "The main CSV becomes the incremental holdout exactly, and each file "
@@ -419,6 +386,12 @@ def parse_args() -> argparse.Namespace:
                     help="Layer 3: never flag on coherence alone below this many records. NPMI is "
                          "unreliable on small samples, and demoting small topics suppresses exactly "
                          "the emerging signal the buffer exists to surface")
+    p.add_argument("--coherence-reference", default=None,
+                    help="segments.csv of a reference run (run_stream.py passes the base run's) whose "
+                         "texts are added to the window when scoring coherence, so a small stream "
+                         "window cannot drive good topics negative")
+    p.add_argument("--coherence-reference-max", type=int, default=50000,
+                    help="Most reference segments added (seeded sample); bounds the cost at scale")
     p.add_argument("--no-coherence", action="store_true",
                     help="Skip inline coherence scoring (saves 1-2 minutes)")
     p.add_argument("--pca-components", type=int, default=50,
@@ -521,6 +494,75 @@ def parse_args() -> argparse.Namespace:
                         "halves the weight and activation memory, and changes the embeddings "
                         "slightly -- precision is part of the --embed-cache key, so switching "
                         "re-embeds from scratch rather than reusing fp32 vectors.")
+    # EXPERIMENT (Laya copies): incremental stream matching. A run with no
+    # --previous-topics (the cold-start base run) ignores all of these and is
+    # the normal pipeline.
+    p.add_argument("--matcher", default=DEFAULT_MATCHER, choices=["centroid", "laya", "hybrid"],
+                   help="How a stream batch (a run with --previous-topics) files incoming records. "
+                        "'centroid' is the original pipeline: re-discover the window, re-match IDs, "
+                        "assign by cosine. 'laya' and 'hybrid' skip re-discovery: the registry is "
+                        "carried as is, incoming records are matched to it, and only the misses are "
+                        "clustered. 'laya' asks Laya about every record; 'hybrid' lets cosine "
+                        "similarity settle the clear matches and misses and asks Laya about the rest.")
+    p.add_argument("--laya-shortlist", type=int, default=12,
+                   help="Nearest topics (by centroid cosine, own brand) offered to Laya per record, "
+                        "plus the 'other' and 'no_issue' exits. Laya's options share a ~256-token "
+                        "budget, so accuracy falls past ~20 options.")
+    p.add_argument("--laya-option-words", type=int, default=12,
+                   help="Words of each topic's label + description sent as its option text.")
+    p.add_argument("--laya-min-confidence", type=float, default=0.50,
+                   help="Accept Laya's topic only when its calibrated answer_confidence reaches this; "
+                        "below it the record goes to the bucket.")
+    p.add_argument("--laya-secondary-prob", type=float, default=0.30,
+                   help="A second topic is assigned when Laya gives it at least this probability "
+                        "(up to --max-topics-per-segment).")
+    p.add_argument("--laya-workers", type=int, default=4, help="Concurrent Laya requests.")
+    p.add_argument("--decision-backend", default="jev", choices=["jev", "gpt", "laya"],
+                   help="Who answers the matcher's per-record questions (matcher 'laya' and "
+                        "'hybrid'). 'jev' (default in this copy): TypeSafe's hosted Jev "
+                        "(TYPESAFE_API_KEY in .env). 'gpt': GPT through AI Router v1. 'laya': the "
+                        "Laya decision model at LAYA_BASE_URL. Same options, gates and fallbacks")
+    p.add_argument("--jev-workers", type=int, default=16,
+                   help="jev backend: concurrent requests (one post per request; Jev has no batch "
+                        "endpoint)")
+    p.add_argument("--jev-max-rpm", type=float, default=1000,
+                   help="jev backend: client-side request cap per minute (Jev allows 1,200)")
+    p.add_argument("--gpt-posts-per-call", type=int, default=20,
+                   help="gpt backend: posts of one brand answered per call, each with its own shortlist")
+    p.add_argument("--gpt-max-options", type=int, default=40,
+                   help="gpt backend: most distinct topics one call may carry (the union of its "
+                        "posts' shortlists)")
+    p.add_argument("--gpt-workers", type=int, default=12, help="gpt backend: concurrent calls")
+    p.add_argument("--laya-max-failure-rate", type=float, default=0.05,
+                   help="Abort the batch when more than this share of Laya questions went "
+                        "unanswered. Below it, unanswered segments are filed by cosine and "
+                        "counted (EXISTING_FALLBACK), so a flaky server cannot quietly turn the "
+                        "experiment back into the control.")
+    p.add_argument("--laya-max-len", type=int, default=None,
+                   help="Per-request max_len for laya-serve (server default when unset).")
+    p.add_argument("--laya-head-max-len", type=int, default=None,
+                   help="Per-request head_max_len, the option token budget (server default 192-256).")
+    p.add_argument("--laya-keep-suppressed", action="store_true",
+                   help="Also offer suppressed and 'Unclear topic' topics to Laya. Off by default: "
+                        "they have no usable name to match against.")
+    p.add_argument("--hybrid-high", type=float, default=0.60,
+                   help="hybrid: best cosine at or above this (and ahead of the runner-up by "
+                        "--hybrid-margin) is a clear match, filed by cosine without asking Laya.")
+    p.add_argument("--hybrid-low", type=float, default=0.45,
+                   help="hybrid: best cosine below this is a clear miss and goes to the bucket.")
+    p.add_argument("--hybrid-margin", type=float, default=0.05,
+                   help="hybrid: a clear match must beat its runner-up by this much.")
+    p.add_argument("--centroid-update", default="running", choices=["running", "none"],
+                   help="laya/hybrid: fold each batch's matched records into their topic's centroid "
+                        "(size-weighted), so the geometry candidate matching uses keeps up with "
+                        "what Laya files there.")
+    p.add_argument("--bucket-trigger-size", type=int, default=0,
+                   help="Scheduled clustering: cluster a brand's bucket only once it holds this many "
+                        "segments, or once its oldest segment has waited --bucket-max-wait-days. "
+                        "0 clusters every run, as the original pipeline does.")
+    p.add_argument("--bucket-max-wait-days", type=float, default=3.0,
+                   help="Scheduled clustering: the longest a bucketed segment waits for its brand's "
+                        "bucket to reach --bucket-trigger-size.")
     return p.parse_args()
 
 
@@ -544,7 +586,7 @@ def build_content_stopset() -> frozenset:
 
 def acknowledgement_similarity(model: SentenceTransformer, embeddings: np.ndarray) -> np.ndarray:
     """Max cosine similarity of each row to any acknowledgement anchor."""
-    anchors = model.encode(ACK_ANCHORS, normalize_embeddings=True,
+    anchors = model.encode(ACK_ANCHORS, prompt=encode_prompt(model), normalize_embeddings=True,
                            convert_to_numpy=True).astype(np.float32)
     return (embeddings @ anchors.T).max(axis=1)
 
@@ -947,7 +989,8 @@ class VramGuard:
         # A few batches of realistic length pull in every kernel and library
         # handle the real run will use.
         warm = ["customer support " * 40] * 8
-        model.encode(warm, batch_size=8, show_progress_bar=False, convert_to_numpy=True)
+        model.encode(warm, prompt=encode_prompt(model), batch_size=8, show_progress_bar=False,
+                     convert_to_numpy=True)
         torch.cuda.synchronize(self.idx)
         torch.cuda.empty_cache()
         reserved = int(torch.cuda.memory_reserved(self.idx))
@@ -1043,7 +1086,8 @@ def choose_batch_size(
     peak = None
     while peak is None:
         try:
-            model.encode([texts[i] for i in longest[:probe_n]], batch_size=probe_n,
+            model.encode([texts[i] for i in longest[:probe_n]], prompt=encode_prompt(model),
+                         batch_size=probe_n,
                          show_progress_bar=False, normalize_embeddings=True,
                          convert_to_numpy=True)
             torch.cuda.synchronize(idx)
@@ -1082,6 +1126,7 @@ def _encode(model: SentenceTransformer, texts: Sequence[str], batch_size: int,
             progress: bool) -> np.ndarray:
     emb = model.encode(
         list(texts),
+        prompt=encode_prompt(model),
         batch_size=batch_size,
         show_progress_bar=progress,
         normalize_embeddings=True,
@@ -1103,11 +1148,44 @@ def describe_device(device: str) -> str:
         return device
 
 
-def load_embedding_model(model_name: str, device: str, fp16: bool = False) -> SentenceTransformer:
-    model = SentenceTransformer(model_name, device=device)
+# Encoder settings for models that need them. A prompt is the text prefix the
+# model was trained to expect for this kind of task (symmetric similarity /
+# clustering here); remote code is the model's own modelling file.
+ENCODER_SETTINGS = {
+    "intfloat/multilingual-e5-base": {"prompt": "query: ", "trust_remote_code": False},
+    "Alibaba-NLP/gte-multilingual-base": {"prompt": "", "trust_remote_code": True},
+    "nomic-ai/nomic-embed-text-v2-moe": {"prompt": "clustering: ", "trust_remote_code": True},
+}
+# Tested on the 20k slice (8 Oct 2026): mpnet (the default) works with every
+# tuned similarity threshold. multilingual-e5-base embeds ~27% faster but its
+# cosine scale is compressed -- random tweet pairs score 0.79 (mpnet 0.17) --
+# so the 0.92 duplicate merge collapsed 62 topics into 12; it needs every
+# threshold recalibrated first. gte-multilingual-base and nomic-embed-text-v2
+# ship modelling code that fails under transformers 5.
+
+
+def encoder_settings(model_name: str, prompt: str = "auto",
+                     trust_remote_code: Optional[bool] = None) -> Dict[str, object]:
+    """Resolve --embed-prompt / --trust-remote-code against the known-model table."""
+    known = ENCODER_SETTINGS.get(model_name, {})
+    return {"prompt": known.get("prompt", "") if prompt == "auto" else prompt,
+            "trust_remote_code": (bool(known.get("trust_remote_code", False))
+                                  if trust_remote_code is None else bool(trust_remote_code))}
+
+
+def load_embedding_model(model_name: str, device: str, fp16: bool = False,
+                         prompt: str = "", trust_remote_code: bool = False) -> SentenceTransformer:
+    model = SentenceTransformer(model_name, device=device, trust_remote_code=trust_remote_code)
     if fp16 and str(device).startswith("cuda"):
         model = model.half()
+    # Every encode call reads this, so the prefix cannot be applied to some
+    # texts (the corpus) and forgotten for others (anchors, probes).
+    model._rtd_prompt = prompt or None
     return model
+
+
+def encode_prompt(model) -> Optional[str]:
+    return getattr(model, "_rtd_prompt", None)
 
 
 def build_embeddings(model: SentenceTransformer, texts: Sequence[str], batch_size: int = 64,
@@ -2013,6 +2091,71 @@ def make_topics(
     return topics, cents
 
 
+POOLED_BRANDS = ("__SMALL_BRANDS__", "GLOBAL")
+
+
+def brand_allow_mask(segment_brands: np.ndarray, topics: List[Topic]) -> Tuple[np.ndarray, np.ndarray]:
+    """Which topics each segment may be filed under: (allow[brand, topic], brand_row[segment]).
+
+    Brand scoping. Airlines all discuss delayed flights, so an unscoped
+    nearest-centroid search files a Delta record under an AmericanAir topic:
+    54.7% of assignments leaked this way. The pooled buckets stay visible
+    because small brands' topics live there.
+    """
+    topic_brands = np.asarray([t.brand for t in topics])
+    pooled = np.isin(topic_brands, list(POOLED_BRANDS))
+    uniq, brand_row = np.unique(np.asarray(segment_brands).astype(str), return_inverse=True)
+    allow = np.empty((len(uniq), len(topics)), dtype=bool)
+    for bi, b in enumerate(uniq):
+        # The pooled buckets exist for brands too small to have topics of
+        # their own. Offering them to every brand let one __SMALL_BRANDS__
+        # topic collect 416 records from the twelve big brands -- the one
+        # mis-tagged topic in out_w300_6.
+        own = topic_brands == b
+        # A brand with neither topics of its own nor pooled buckets stays
+        # unassigned, so candidate discovery can build its topics. Falling
+        # back to "every topic" filed 774 McDonalds/MicrosoftHelps records
+        # under AppleSupport, Uber and Spotify topics when those brands
+        # reappeared after a month of silence.
+        allow[bi] = own if own.any() else pooled
+    return allow, brand_row
+
+
+def top_k_topics(
+    embeddings: np.ndarray,
+    topic_matrix: np.ndarray,
+    k: int,
+    allow: Optional[np.ndarray] = None,
+    brand_row: Optional[np.ndarray] = None,
+    block_bytes: int = 64 * 1024 ** 2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Each segment's k most similar topics, best first: (indices, cosines).
+
+    One chunked matmul. The chunk is sized by bytes, not rows, so peak memory
+    stays flat as the topic registry grows across streaming runs. A topic the
+    segment may not see scores -1.
+    """
+    n, n_topics = embeddings.shape[0], topic_matrix.shape[0]
+    k = max(1, min(k, n_topics))
+    top_idx = np.empty((n, k), dtype=np.int64)
+    top_sim = np.empty((n, k), dtype=np.float32)
+    step = max(1, block_bytes // (4 * n_topics))
+    for lo in range(0, n, step):
+        hi = min(lo + step, n)
+        sims = l2_normalize(np.asarray(embeddings[lo:hi], dtype=np.float32)) @ topic_matrix.T
+        if allow is not None:
+            sims = np.where(allow[brand_row[lo:hi]], sims, -1.0)
+        if k < n_topics:
+            cand = np.argpartition(-sims, k - 1, axis=1)[:, :k]
+        else:
+            cand = np.broadcast_to(np.arange(n_topics), (hi - lo, n_topics))
+        cand_sim = np.take_along_axis(sims, cand, axis=1)
+        order = np.argsort(-cand_sim, axis=1)[:, :k]
+        top_idx[lo:hi] = np.take_along_axis(cand, order, axis=1)
+        top_sim[lo:hi] = np.take_along_axis(cand_sim, order, axis=1)
+    return top_idx, top_sim
+
+
 def assign_to_topics(
     segments: pd.DataFrame,
     embeddings: np.ndarray,
@@ -2049,47 +2192,12 @@ def assign_to_topics(
     # Normalised once here, rather than once per segment inside the loop.
     topic_matrix = l2_normalize(np.asarray([t.centroid for t in topics], dtype=np.float32))
 
-    # Brand scoping. Airlines all discuss delayed flights, so an unscoped
-    # nearest-centroid search files a Delta record under an AmericanAir topic:
-    # 54.7% of assignments leaked this way. The pooled buckets stay visible
-    # because small brands' topics live there.
     allow = brand_row = None
     if brand_scoped:
-        topic_brands = np.asarray([t.brand for t in topics])
-        pooled = np.isin(topic_brands, ["__SMALL_BRANDS__", "GLOBAL"])
-        uniq, brand_row = np.unique(segments["brand"].astype(str).to_numpy(), return_inverse=True)
-        allow = np.empty((len(uniq), n_topics), dtype=bool)
-        for bi, b in enumerate(uniq):
-            # The pooled buckets exist for brands too small to have topics of
-            # their own. Offering them to every brand let one __SMALL_BRANDS__
-            # topic collect 416 records from the twelve big brands -- the one
-            # mis-tagged topic in out_w300_6.
-            own = topic_brands == b
-            # A brand with neither topics of its own nor pooled buckets stays
-            # unassigned, so candidate discovery can build its topics. Falling
-            # back to "every topic" filed 774 McDonalds/MicrosoftHelps records
-            # under AppleSupport, Uber and Spotify topics when those brands
-            # reappeared after a month of silence.
-            allow[bi] = own if own.any() else pooled
+        allow, brand_row = brand_allow_mask(segments["brand"].to_numpy(), topics)
 
     k = max(1, min(max_topics_per_segment if multi_topic else 1, n_topics))
-    top_idx = np.empty((n, k), dtype=np.int64)
-    top_sim = np.empty((n, k), dtype=np.float32)
-
-    step = max(1, block_bytes // (4 * n_topics))
-    for lo in range(0, n, step):
-        hi = min(lo + step, n)
-        sims = l2_normalize(np.asarray(embeddings[lo:hi], dtype=np.float32)) @ topic_matrix.T
-        if allow is not None:
-            sims = np.where(allow[brand_row[lo:hi]], sims, -1.0)
-        if k < n_topics:
-            cand = np.argpartition(-sims, k - 1, axis=1)[:, :k]
-        else:
-            cand = np.broadcast_to(np.arange(n_topics), (hi - lo, n_topics))
-        cand_sim = np.take_along_axis(sims, cand, axis=1)
-        order = np.argsort(-cand_sim, axis=1)[:, :k]
-        top_idx[lo:hi] = np.take_along_axis(cand, order, axis=1)
-        top_sim[lo:hi] = np.take_along_axis(cand_sim, order, axis=1)
+    top_idx, top_sim = top_k_topics(embeddings, topic_matrix, k, allow, brand_row, block_bytes)
 
     # top_sim is sorted descending, so the rows clearing the threshold are
     # always a prefix -- the same set the loop's `break` produced.
@@ -2116,6 +2224,338 @@ def assign_to_topics(
     out["similarity"] = sim
     out["assignment_type"] = np.where(assigned, "EXISTING", "UNASSIGNED")
     return pd.DataFrame(out)
+
+
+# ---- EXPERIMENT (Laya copies): incremental stream matching ------------------
+#
+# A stream batch no longer re-discovers its window. The registry is carried as
+# it stands, incoming records are matched to it (by Laya, or by cosine with
+# Laya deciding the borderline band), and only the misses go to the bucket that
+# candidate discovery clusters. Everything after assignment is unchanged.
+
+# Unassigned rows that never enter the bucket: Laya judged them small talk.
+NO_ISSUE_TYPE = "LAYA_NO_ISSUE"
+
+
+def laya_option_text(topic: Topic, max_words: int) -> str:
+    """Label plus the start of the LLM description: what Laya compares a post with.
+
+    Laya's options share a ~256-token budget, so each option keeps to a dozen
+    words; a long option is trimmed by the server anyway, and trimmed options
+    can collapse into the same text.
+    """
+    words = str(topic.label or "").split()
+    desc = str(topic.description or "").split()
+    if desc:
+        words = words + [":"] + desc
+    elif topic.keywords:
+        words = words + [":"] + [str(k) for k in topic.keywords]
+    return " ".join(words[:max(3, max_words)]).replace(" :", ":")
+
+
+def laya_eligible(topics: List[Topic], keep_suppressed: bool) -> np.ndarray:
+    """Topics Laya may choose. Suppressed and unnamed topics have no name worth matching:
+    'Unclear topic' or 'Customer thank-you replies' would only soak up records the
+    no_issue exit or the bucket should get."""
+    if keep_suppressed:
+        return np.ones(len(topics), dtype=bool)
+    return np.asarray([not t.suppressed and t.label != UNCLEAR_LABEL for t in topics], dtype=bool)
+
+
+def make_decision_client(args):
+    """The configured decision backend and its worker count (same decide() contract)."""
+    if getattr(args, "decision_backend", "jev") == "jev":
+        from jev_client import JevClient
+        return JevClient(max_rpm=args.jev_max_rpm), args.jev_workers
+    if args.decision_backend == "gpt":
+        from gpt_decision_client import GptDecisionClient
+        return (GptDecisionClient(posts_per_call=args.gpt_posts_per_call,
+                                  max_options=args.gpt_max_options), args.gpt_workers)
+    from laya_client import LayaClient
+    return (LayaClient(min_confidence=None, max_len=args.laya_max_len,
+                       head_max_len=args.laya_head_max_len), args.laya_workers)
+
+
+def assign_incremental(
+    segments: pd.DataFrame,
+    embeddings: np.ndarray,
+    topics: List[Topic],
+    args,
+    mode: str,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """File incoming segments against the carried registry, with Laya.
+
+    mode 'laya': every segment with a topic in scope is a Laya question.
+    mode 'hybrid': cosine settles a clear match (best >= --hybrid-high and ahead
+    of the runner-up by --hybrid-margin; filed exactly as assign_to_topics would)
+    and a clear miss (best < --hybrid-low, straight to the bucket); Laya decides
+    the band between.
+
+    A Laya question offers the segment's --laya-shortlist nearest eligible
+    topics of its own brand plus two exits, 'other' (bucket) and 'no_issue'
+    (unassigned, kept out of the bucket). A topic is accepted when Laya's
+    calibrated answer_confidence reaches --laya-min-confidence; a second topic
+    when its probability reaches --laya-secondary-prob. A segment Laya could not
+    answer falls back to the cosine rule and says so in its assignment_type.
+
+    Returns the assignment frame (assign_to_topics' columns plus `primary`,
+    True on each segment's first topic) and counts for run_metadata.json.
+    """
+    from laya_client import NO_ISSUE_KEY, NO_ISSUE_TEXT, OTHER_KEY, OTHER_TEXT
+
+    cols = ["record_id", "segment_id", "segment_index", "event_time", "brand", "clean_text"]
+    stats: Dict[str, object] = {"mode": mode, "segments": int(len(segments))}
+    n = len(segments)
+    if not topics or n == 0:
+        out = assign_to_topics(segments, embeddings, topics, args.min_similarity)
+        out["primary"] = True
+        return out, stats
+
+    topic_ids = np.asarray([t.topic_id for t in topics], dtype=object)
+    topic_matrix = l2_normalize(np.asarray([t.centroid for t in topics], dtype=np.float32))
+    allow, brand_row = brand_allow_mask(segments["brand"].to_numpy(), topics)
+    k_cos = max(1, args.max_topics_per_segment)
+    cos_idx, cos_sim = top_k_topics(embeddings, topic_matrix, max(2, k_cos), allow, brand_row)
+    eligible = laya_eligible(topics, args.laya_keep_suppressed)
+    short_idx, short_sim = top_k_topics(embeddings, topic_matrix, args.laya_shortlist,
+                                        allow & eligible[None, :], brand_row)
+
+    best = cos_sim[:, 0]
+    second = cos_sim[:, 1] if cos_sim.shape[1] > 1 else np.full(n, -1.0, dtype=np.float32)
+    has_scope = best > -1.0
+    has_short = short_sim[:, 0] > -1.0
+    if mode == "hybrid":
+        clear = (best >= args.hybrid_high) & ((best - second) >= args.hybrid_margin)
+        miss = ~clear & (best < args.hybrid_low)
+    else:
+        clear = np.zeros(n, dtype=bool)
+        miss = np.zeros(n, dtype=bool)
+    ask = has_scope & has_short & ~clear & ~miss
+
+    def cosine_rows(i: int, kind: str) -> List[Tuple[Optional[str], float, str, Optional[float]]]:
+        """assign_to_topics' rule for one segment: top topics clearing --min-similarity."""
+        rows = [(str(topic_ids[cos_idx[i, r]]), float(cos_sim[i, r]), kind, None)
+                for r in range(min(k_cos, cos_sim.shape[1]))
+                if cos_sim[i, r] >= args.min_similarity]
+        return rows or [(None, float(best[i]), "UNASSIGNED", None)]
+
+    # Build the Laya questions. The shortlist is sent in registry order, not
+    # similarity order, so neighbouring posts produce identical option lists
+    # and share /batch calls -- and Laya cannot read rank from option order.
+    opt_text = [laya_option_text(t, args.laya_option_words) for t in topics]
+    ask_rows = np.where(ask)[0]
+    requests = []
+    for i in ask_rows:
+        sl = sorted(int(j) for j, s in zip(short_idx[i], short_sim[i]) if s > -1.0)
+        crit = {str(topic_ids[j]): opt_text[j] for j in sl}
+        crit[OTHER_KEY] = OTHER_TEXT
+        crit[NO_ISSUE_KEY] = NO_ISSUE_TEXT
+        instr = (f"Which topic does this customer post to {segments['brand'].iat[i]} belong to? "
+                 f"Answer '{OTHER_KEY}' if none fits.")
+        requests.append((instr, crit, str(segments["clean_text"].iat[i])[:1000]))
+
+    decisions: List[Optional[tuple]] = []
+    if requests:
+        client, workers = make_decision_client(args)
+        t0 = time.perf_counter()
+        decisions = client.decide(requests, workers=workers)
+        stats["laya"] = {**client.config(), **client.summary(),
+                         "seconds": round(time.perf_counter() - t0, 1)}
+    decision_of = dict(zip(ask_rows.tolist(), decisions))
+
+    # Cosine of each segment to each topic it was offered, for the similarity column.
+    short_cos = {int(i): dict(zip(short_idx[i].tolist(), short_sim[i].tolist())) for i in ask_rows}
+    id_to_idx = {str(t): j for j, t in enumerate(topic_ids)}
+
+    counts = {"cosine_clear": 0, "cosine_miss": 0, "no_scope": 0, "laya_topic": 0,
+              "laya_second_topic": 0, "laya_other": 0, "laya_no_issue": 0,
+              "laya_low_confidence": 0, "laya_failed_fallback": 0}
+    seg_rows: List[int] = []
+    out_rows: List[Tuple[Optional[str], float, str, Optional[float]]] = []
+    for i in range(n):
+        if clear[i]:
+            rows = cosine_rows(i, "EXISTING")
+            counts["cosine_clear"] += 1
+        elif miss[i]:
+            rows = [(None, float(best[i]), "UNASSIGNED", None)]
+            counts["cosine_miss"] += 1
+        elif not ask[i]:
+            rows = [(None, float(best[i]), "UNASSIGNED", None)]
+            counts["no_scope"] += 1
+        else:
+            dec = decision_of.get(i)
+            if dec is None:
+                rows = cosine_rows(i, "EXISTING_FALLBACK")
+                counts["laya_failed_fallback"] += 1
+            else:
+                choice, conf, probs = dec
+                if choice == NO_ISSUE_KEY:
+                    rows = [(None, float(best[i]), NO_ISSUE_TYPE, conf)]
+                    counts["laya_no_issue"] += 1
+                elif choice == OTHER_KEY or choice not in id_to_idx:
+                    rows = [(None, float(best[i]), "LAYA_OTHER", conf)]
+                    counts["laya_other"] += 1
+                elif conf < args.laya_min_confidence:
+                    rows = [(None, float(best[i]), "LAYA_LOW_CONFIDENCE", conf)]
+                    counts["laya_low_confidence"] += 1
+                else:
+                    sims = short_cos[i]
+                    rows = [(choice, float(sims.get(id_to_idx[choice], np.nan)), "LAYA", conf)]
+                    counts["laya_topic"] += 1
+                    runners = sorted(((p, key) for key, p in probs.items()
+                                      if key != choice and key in id_to_idx), reverse=True)
+                    for p, key in runners[:max(0, args.max_topics_per_segment - 1)]:
+                        if p < args.laya_secondary_prob:
+                            break
+                        rows.append((key, float(sims.get(id_to_idx[key], np.nan)), "LAYA", p))
+                        counts["laya_second_topic"] += 1
+        seg_rows.extend([i] * len(rows))
+        out_rows.extend(rows)
+
+    seg_rows_a = np.asarray(seg_rows, dtype=np.int64)
+    out = {c: segments[c].to_numpy()[seg_rows_a] for c in cols}
+    out["topic_id"] = np.asarray([r[0] for r in out_rows], dtype=object)
+    out["similarity"] = np.asarray([r[1] for r in out_rows], dtype=float)
+    out["assignment_type"] = np.asarray([r[2] for r in out_rows], dtype=object)
+    out["laya_confidence"] = np.asarray([np.nan if r[3] is None else r[3] for r in out_rows],
+                                        dtype=float)
+    frame = pd.DataFrame(out)
+    frame["primary"] = ~pd.Series(seg_rows_a).duplicated().to_numpy()
+    stats.update(counts)
+    stats["asked_laya"] = int(len(ask_rows))
+    stats["shortlist_size_mean"] = (round(float(np.mean([len(r[1]) - 2 for r in requests])), 2)
+                                    if requests else 0.0)
+    return frame, stats
+
+
+def carry_registry(
+    previous_topics: List[Topic],
+    max_age_days: int,
+    window_end: Optional[pd.Timestamp],
+) -> Tuple[List[Topic], pd.DataFrame, Dict[str, int]]:
+    """The previous registry as this batch's starting inventory, nothing re-discovered.
+
+    Every topic starts DORMANT with size 0 and is revived by the records this
+    batch files under it, exactly as stabilize_topics treats a carried-forward
+    topic. Its LLM label is kept (`llm_carried`) until its centroid moves too
+    far (see update_centroids). Topics unseen for `max_age_days` are retired.
+    Returns the topics, the stability decisions and each topic's previous size,
+    which weights its centroid against the new records.
+    """
+    cutoff = None
+    if max_age_days and max_age_days > 0 and window_end is not None:
+        cutoff = window_end - pd.Timedelta(days=max_age_days)
+    topics: List[Topic] = []
+    decisions = []
+    prev_size: Dict[str, int] = {}
+    for old in previous_topics:
+        last = pd.to_datetime(old.last_seen_at, errors="coerce", utc=True)
+        if cutoff is not None and not pd.isna(last) and last < cutoff:
+            decisions.append({"new_label": old.label, "previous_topic_id": old.topic_id,
+                              "similarity": np.nan, "best_available_similarity": np.nan,
+                              "decision": "RETIRED_STALE"})
+            continue
+        t = Topic(**{**asdict(old)})
+        if str(t.label_source or "") == "llm":
+            t.label_source = "llm_carried"
+        prev_size[t.topic_id] = int(old.size or 0)
+        t.status = "DORMANT"
+        t.size = 0
+        topics.append(t)
+        decisions.append({"new_label": t.label, "previous_topic_id": old.topic_id,
+                          "similarity": 1.0, "best_available_similarity": 1.0,
+                          "decision": "CARRIED_FORWARD"})
+    return topics, pd.DataFrame(decisions), prev_size
+
+
+def carry_history_assignments(
+    prev_dir: Path,
+    history: pd.DataFrame,
+    topic_ids: set,
+    remap: Dict[str, str],
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    """Reuse the decisions earlier batches made for the window's history chunks.
+
+    Under a sliding window every history chunk was the holdout of an earlier
+    batch, and that batch's outputs hold how it was filed. Re-filing it here by
+    another method would change the baseline HotScore compares against, and a
+    change of method alone reads as growth. Rows whose topic has since been
+    merged are re-pointed; rows whose topic is gone become UNASSIGNED.
+
+    Returns the carried rows and a mask over `history` of segments the earlier
+    outputs never saw (the caller files those by cosine).
+    """
+    cols = ["record_id", "segment_id", "segment_index", "event_time", "brand", "clean_text"]
+    known = np.zeros(len(history), dtype=bool)
+    if history.empty:
+        return history[cols].assign(topic_id=None, similarity=np.nan,
+                                    assignment_type="UNASSIGNED"), known
+    keep = ["segment_id", "topic_id", "similarity", "assignment_type"]
+    frames = []
+    for name in ("topic_assignments.csv", "unassigned_recent_records.csv"):
+        p = prev_dir / name
+        if p.exists():
+            f = pd.read_csv(p, dtype={"segment_id": str, "record_id": str, "topic_id": str},
+                            low_memory=False)
+            frames.append(f[[c for c in keep if c in f.columns]])
+    if not frames:
+        return history[cols].iloc[0:0].assign(topic_id=None, similarity=np.nan,
+                                              assignment_type="UNASSIGNED"), known
+    prev = pd.concat(frames, ignore_index=True)
+    hist_ids = history["segment_id"].astype(str)
+    prev = prev[prev["segment_id"].isin(set(hist_ids))]
+    known = hist_ids.isin(set(prev["segment_id"])).to_numpy()
+
+    prev["topic_id"] = prev["topic_id"].replace(remap)
+    has_topic = prev["topic_id"].notna() & prev["topic_id"].isin(topic_ids)
+    got = prev[has_topic].drop_duplicates(["segment_id", "topic_id"])
+    # A known segment with no surviving topic keeps one UNASSIGNED row.
+    lost = sorted(set(prev["segment_id"]) - set(got["segment_id"]))
+    none_rows = pd.DataFrame({"segment_id": lost, "topic_id": None, "similarity": np.nan,
+                              "assignment_type": "UNASSIGNED"})
+    rows = pd.concat([got, none_rows], ignore_index=True)
+    meta = history[cols].assign(segment_id=hist_ids)
+    return meta.merge(rows, on="segment_id", how="inner"), known
+
+
+def update_centroids(
+    topics: List[Topic],
+    assignments: pd.DataFrame,
+    seg_ids: Sequence[str],
+    embeddings: np.ndarray,
+    prev_size: Dict[str, int],
+    relabel_below: float,
+) -> Dict[str, int]:
+    """Fold this batch's matched records into their topics' centroids.
+
+    Without re-discovery nothing else moves a centroid, yet candidate matching,
+    capacity merges and the next batch's shortlists all read it. Each topic's
+    centroid becomes the size-weighted mean of its previous centroid (weighted
+    by its previous size) and the segments filed under it as their first topic.
+    A topic whose centroid moved below `relabel_below` cosine from where it was
+    named is sent back to the LLM for a fresh label.
+    """
+    pos = {str(s): i for i, s in enumerate(seg_ids)}
+    prim = assignments[assignments["primary"] & assignments["topic_id"].notna()]
+    by_id = {t.topic_id: t for t in topics}
+    n_upd = n_relabel = 0
+    for tid, grp in prim.groupby("topic_id"):
+        t = by_id.get(tid)
+        idx = [pos[s] for s in grp["segment_id"].astype(str) if s in pos]
+        if t is None or not idx:
+            continue
+        old = np.asarray(t.centroid, dtype=np.float32)
+        old = old / max(np.linalg.norm(old), 1e-12)
+        add = l2_normalize(embeddings[idx].astype(np.float32)).sum(axis=0)
+        new = old * max(1, prev_size.get(tid, 0)) + add
+        new = new / max(np.linalg.norm(new), 1e-12)
+        t.centroid = new.astype(np.float32).tolist()
+        n_upd += 1
+        if (relabel_below > 0 and float(old @ new) < relabel_below
+                and str(t.label_source or "") == "llm_carried"):
+            t.label_source = "llm_stale"          # re-asked; the old label stays until answered
+            n_relabel += 1
+    return {"centroids_updated": n_upd, "relabel_requested": n_relabel}
 
 
 def map_clusters_to_existing_topics(
@@ -2750,7 +3190,7 @@ def sanitize_previous_topics(previous: List[Topic], window_end: pd.Timestamp) ->
 
 
 def merge_topics_into(topics: List[Topic], assigned: pd.DataFrame,
-                      remap: Dict[str, str], keep_aliases: bool = False) -> pd.DataFrame:
+                      remap: Dict[str, str]) -> pd.DataFrame:
     """Fold each `remap` source topic into its target, in place on `topics`.
 
     The survivor's centroid becomes the size-weighted mean, so it keeps
@@ -2768,9 +3208,6 @@ def merge_topics_into(topics: List[Topic], assigned: pd.DataFrame,
         a_.size = (a_.size or 0) + (b_.size or 0)
         if b_.created_at and (not a_.created_at or str(b_.created_at) < str(a_.created_at)):
             a_.created_at = b_.created_at
-        if keep_aliases:
-            # P8. The absorbed ID (and anything it had absorbed) now resolves here.
-            a_.aliases = sorted(set(a_.aliases or []) | {b_.topic_id} | set(b_.aliases or []))
     assigned = assigned.copy()
     assigned["topic_id"] = assigned["topic_id"].replace(remap)
     assigned = assigned.drop_duplicates(["segment_id", "topic_id"])
@@ -2880,7 +3317,6 @@ def stabilize_topics(
     max_age_days: int = 0,
     window_end: Optional[pd.Timestamp] = None,
     label_reuse_similarity: float = 0.0,
-    keep_aliases: bool = False,
 ) -> Tuple[List[Topic], pd.DataFrame]:
     """Match newly discovered clusters to previous topics by original-space centroid similarity.
 
@@ -2960,8 +3396,6 @@ def stabilize_topics(
             t.topic_id = old.topic_id
             t.created_at = old.created_at or t.created_at
             t.status = "ACTIVE"
-            if keep_aliases and old.aliases:
-                t.aliases = list(old.aliases)        # P8: absorbed IDs stay resolvable
             # P6 label stability. A topic whose centroid barely moved is the
             # same topic; re-asking the LLM every batch gave 385 of 504
             # persistent topics a different name in all six batches.
@@ -3038,148 +3472,6 @@ def stabilize_topics(
     return new_topics, pd.DataFrame(decisions)
 
 
-# ---- P8. Near-duplicate same-brand topics (all opt-in) ---------------------
-#
-# Same-brand topics can cover one issue and still survive every merge: in the
-# 20k slice AmericanAir kept "Flight cancellations and delays" (T8) and
-# "Flight delays and cancellations" (T11) apart because their centroids sat at
-# 0.80 (duplicate merge needs 0.92), the labels differ by word order (label
-# merge needs the identical string), and capacity merging never engaged --
-# while 61% of T11's records were also on T8. The helpers below back six
-# experiments: label matching by meaning, record-overlap merging, an LLM merge
-# review, label disambiguation, parent groups and ID aliases.
-
-LABEL_FILLER_WORDS = {"and", "of", "the", "with", "for", "to", "in", "on", "a", "an", "or",
-                      "issue", "issues", "problem", "problems", "complaint", "complaints"}
-
-
-def label_wordset(label: str) -> frozenset:
-    """Content words of a label, order-free: 'X and Y issues' == 'Y and X'."""
-    return frozenset(w for w in re.findall(r"[a-z0-9]+", str(label).lower())
-                     if w not in LABEL_FILLER_WORDS)
-
-
-def topic_members(assigned: pd.DataFrame) -> Dict[str, set]:
-    a = assigned[assigned["topic_id"].notna()]
-    return {tid: set(g["record_id"].astype(str)) for tid, g in a.groupby("topic_id")}
-
-
-def containment(members: Dict[str, set], a: str, b: str) -> float:
-    """Share of the smaller topic's records that also sit on the other."""
-    ma, mb = members.get(a, set()), members.get(b, set())
-    small = min(len(ma), len(mb))
-    return len(ma & mb) / small if small else 0.0
-
-
-def same_brand_pairs(topics: List[Topic], min_similarity: float,
-                     eligible=None) -> List[Tuple[float, Topic, Topic]]:
-    """(centroid cosine, a, b) for live same-brand pairs at or above min_similarity."""
-    by_brand: Dict[str, List[Topic]] = {}
-    for t in topics:
-        if (t.size or 0) > 0 and (eligible is None or eligible(t)):
-            by_brand.setdefault(t.brand, []).append(t)
-    out = []
-    for grp in by_brand.values():
-        if len(grp) < 2:
-            continue
-        C = l2_normalize(np.asarray([t.centroid for t in grp], dtype=np.float32))
-        S = C @ C.T
-        iu = np.triu_indices(len(grp), 1)
-        for i, j in zip(*iu):
-            if S[i, j] >= min_similarity:
-                out.append((float(S[i, j]), grp[i], grp[j]))
-    out.sort(key=lambda x: -x[0])
-    return out
-
-
-def plan_pair_merges(candidates: List[Tuple[float, Topic, Topic, Dict]],
-                     reason: str, blocked: Optional[set] = None,
-                     max_aliases: int = 0) -> Tuple[Dict[str, str], List[Dict]]:
-    """Merge each accepted pair smaller-into-larger, strongest first, with no chains.
-
-    A topic that absorbs another is never itself merged away, and a topic
-    already merged away cannot absorb, so A~B, B~C cannot snowball into one
-    ever-broader topic (T8 ~ T11 ~ T12 in the slice are 0.80 / 0.77).
-
-    `blocked` carries topics that absorbed something in an EARLIER merge step
-    of this run: they may not absorb again, since a topic broadened by one
-    merge then matches a neighbour it did not match before (in the slice T8
-    absorbed T11 by overlap, was relabelled, and then took T12 by label).
-    `max_aliases` caps how many absorbed IDs one topic may hold over its life.
-    """
-    blocked = blocked or set()
-    gone, absorber, remap, log = set(), set(), {}, []
-    planned: Dict[str, int] = {}            # IDs each absorber gains in THIS plan
-    for score, a, b, info in sorted(candidates, key=lambda x: -x[0]):
-        small, big = (a, b) if (a.size or 0) <= (b.size or 0) else (b, a)
-        if small.topic_id in gone or big.topic_id in gone or small.topic_id in absorber:
-            continue
-        if big.topic_id in blocked or small.topic_id in blocked:
-            continue
-        # The merge gives `big` the small topic's ID plus everything it held.
-        gain = 1 + len(small.aliases or [])
-        if max_aliases and len(big.aliases or []) + planned.get(big.topic_id, 0) + gain > max_aliases:
-            continue
-        planned[big.topic_id] = planned.get(big.topic_id, 0) + gain
-        gone.add(small.topic_id)
-        absorber.add(big.topic_id)
-        remap[small.topic_id] = big.topic_id
-        log.append({"merged_topic_id": small.topic_id, "into_topic_id": big.topic_id,
-                    "reason": reason, "brand": small.brand, "label": small.label,
-                    "into_label": big.label, "merged_size": small.size, "into_size": big.size,
-                    "score": round(float(score), 4), **info})
-    return remap, log
-
-
-def label_vectors(model, topics: List[Topic]) -> Dict[str, np.ndarray]:
-    """Embedding of each topic's label, with the run's own encoder."""
-    ts = [t for t in topics if t.label]
-    if not ts:
-        return {}
-    v = model.encode([str(t.label) for t in ts], normalize_embeddings=True,
-                     show_progress_bar=False, convert_to_numpy=True)
-    return {t.topic_id: np.asarray(v[i], dtype=np.float32) for i, t in enumerate(ts)}
-
-
-def build_topic_groups(topics: List[Topic], members: Dict[str, set],
-                       min_similarity: float) -> pd.DataFrame:
-    """Parent groups of same-brand topics, complete linkage on centroids.
-
-    Complete linkage means EVERY pair inside a group clears min_similarity,
-    so a group cannot grow by chaining. Nothing is merged: each topic keeps
-    its ID, size and label, and gains group_id / group_label / group_size.
-    """
-    rows = []
-    by_brand: Dict[str, List[Topic]] = {}
-    for t in topics:
-        t.group_id = t.group_label = t.group_size = None
-        if (t.size or 0) > 0:
-            by_brand.setdefault(t.brand, []).append(t)
-    for brand, grp in sorted(by_brand.items()):
-        if len(grp) < 2:
-            continue
-        C = l2_normalize(np.asarray([t.centroid for t in grp], dtype=np.float32))
-        lab = AgglomerativeClustering(n_clusters=None, metric="cosine", linkage="complete",
-                                      distance_threshold=1.0 - min_similarity).fit_predict(C)
-        for g in sorted(set(lab)):
-            mem = [grp[i] for i in np.where(lab == g)[0]]
-            if len(mem) < 2:
-                continue
-            mem.sort(key=lambda t: -(t.size or 0))
-            gid = f"G_{mem[0].topic_id}"           # named after its largest member: stable while it lives
-            recs = set().union(*(members.get(t.topic_id, set()) for t in mem))
-            for t in mem:
-                t.group_id, t.group_label, t.group_size = gid, mem[0].label, len(recs)
-            sims = C[[grp.index(t) for t in mem]] @ C[[grp.index(t) for t in mem]].T
-            rows.append({"group_id": gid, "brand": brand, "group_label": mem[0].label,
-                         "topics": len(mem), "records": len(recs),
-                         "sum_of_sizes": int(sum(t.size or 0 for t in mem)),
-                         "min_pair_similarity": round(float(sims.min()), 4),
-                         "topic_ids": " ".join(t.topic_id for t in mem),
-                         "labels": " | ".join(str(t.label) for t in mem)})
-    return pd.DataFrame(rows)
-
-
 def run(args: argparse.Namespace) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -3191,6 +3483,16 @@ def run(args: argparse.Namespace) -> int:
     previous_topics, _prev_dupes = dedupe_topic_ids(previous_topics)
     if _prev_dupes:
         print(f"Previous registry: dropped {_prev_dupes} duplicate topic_id entries")
+
+    # EXPERIMENT (Laya copies). A stream batch -- a run with a registry to match
+    # against -- carries that registry instead of re-discovering its window, and
+    # clusters only what the matcher could not file. The cold start (no
+    # --previous-topics) is the normal pipeline.
+    incremental = args.matcher != "centroid" and bool(previous_topics)
+    if incremental:
+        make_decision_client(args)[0].health()   # fail here, not after the embedding stage
+        print(f"Matcher: {args.matcher} ({args.decision_backend} decisions) -- registry of "
+              f"{len(previous_topics)} topics carried, not re-discovered")
 
     # Sliding window (P2 of the out300 review). History chunks are loaded and
     # segmented one file at a time, exactly as a single-chunk run would, so
@@ -3266,7 +3568,9 @@ def run(args: argparse.Namespace) -> int:
         _bounds = np.cumsum([0] + part_sizes)
         _slices = list(zip(_bounds[:-1].tolist(), _bounds[1:].tolist()))
 
-    model = load_embedding_model(args.model, _device, _fp16)
+    _enc = encoder_settings(args.model, args.embed_prompt, args.trust_remote_code)
+    model = load_embedding_model(args.model, _device, _fp16, _enc["prompt"],
+                                 _enc["trust_remote_code"])
     _guard = None
     if _vram_budget is not None:
         _guard = VramGuard(_device, _max_vram)
@@ -3276,7 +3580,9 @@ def run(args: argparse.Namespace) -> int:
     _emb_parts, _n_cached, _n_fresh, _emb_dt = [], 0, 0, 0.0
     for lo, hi in _slices:
         _texts = _all_texts[lo:hi]
-        _key = embedding_cache_key(args.model, _texts, _prec)
+        # The prompt changes every vector, so it is part of the cache identity.
+        _key = embedding_cache_key(args.model + (f"|prompt={_enc['prompt']}" if _enc["prompt"] else ""),
+                                   _texts, _prec)
         e = load_cached_embeddings(args.embed_cache, _key)
         if e is not None and len(e) == len(_texts):
             _n_cached += len(_texts)
@@ -3327,6 +3633,11 @@ def run(args: argparse.Namespace) -> int:
         train_mask = ~test_mask
         cutoff_time = pd.to_datetime(segments.loc[test_mask, "event_time"],
                                      errors="coerce", utc=True).min()
+    elif incremental:
+        # Nothing is discovered from history, so a single chunk is all incoming data.
+        test_mask = np.ones(len(segments), dtype=bool)
+        train_mask = ~test_mask
+        cutoff_time = pd.to_datetime(segments["event_time"], errors="coerce", utc=True).min()
     elif args.test_fraction > 0 and 0 < args.test_fraction < 0.5:
         cutoff_idx = int(math.floor(len(df) * (1.0 - args.test_fraction)))
         cutoff_time = df.iloc[cutoff_idx]["event_time"]
@@ -3350,8 +3661,12 @@ def run(args: argparse.Namespace) -> int:
     # the incremental holdout never leaks into the manifold. Every pool below
     # transforms through this; nothing refits per pool.
     umap_projector: Optional[UmapProjector] = None
+    # Incremental batches only cluster the bucket, through the frozen manifold;
+    # drift is measured on what arrived, and a refit (rare) uses the whole window.
+    _fit_segs, _fit_emb = (segments, embeddings) if incremental else (train_segments, train_embeddings)
+    _drift_emb = recent_embeddings if incremental else train_embeddings
     if args.reducer == "umap" and not args.umap_refit_per_pool:
-        umap_projector = get_or_fit_umap(train_segments, train_embeddings, args, timer)
+        umap_projector = get_or_fit_umap(_fit_segs, _fit_emb, args, timer)
 
         # P6. Act on the drift signal instead of only recording it. A frozen
         # manifold is trustworthy exactly as long as incoming data still looks
@@ -3360,14 +3675,14 @@ def run(args: argparse.Namespace) -> int:
         # topic. Measured here, before anything is clustered, so the refit can
         # still happen in the same run.
         if args.umap_drift_threshold > 0 and umap_projector.models:
-            d = umap_projector._drift(umap_projector._key(None), train_embeddings)
+            d = umap_projector._drift(umap_projector._key(None), _drift_emb)
             if d is not None:
                 print(f"UMAP drift check: {d:.4f} against threshold {args.umap_drift_threshold}")
                 if d > args.umap_drift_threshold:
                     print(f"  drift exceeds threshold -- refitting the manifold on current data")
                     _forced = argparse.Namespace(**vars(args))
                     _forced.umap_refit = True
-                    umap_projector = get_or_fit_umap(train_segments, train_embeddings, _forced, timer)
+                    umap_projector = get_or_fit_umap(_fit_segs, _fit_emb, _forced, timer)
                     umap_projector.meta["refit_trigger"] = {
                         "reason": "drift_above_threshold",
                         "measured": round(float(d), 5),
@@ -3404,6 +3719,8 @@ def run(args: argparse.Namespace) -> int:
             small_idx.extend(idx.tolist())
     if small_idx:
         brand_groups.append(("__SMALL_BRANDS__", np.asarray(small_idx, dtype=int)))
+    if incremental:
+        brand_groups = []              # the carried registry is the inventory
 
     for brand_key, idx in brand_groups:
         if len(idx) < max(args.min_cluster_size * 2, 50):
@@ -3487,10 +3804,20 @@ def run(args: argparse.Namespace) -> int:
                     "assignment_type": "DISCOVERY",
                 })
 
-    timer.mark("discovery clustering", f"{len(topics):,} topics from {len(brand_groups)} pools")
+    timer.mark("discovery clustering", "skipped: registry carried" if incremental
+               else f"{len(topics):,} topics from {len(brand_groups)} pools")
 
     # Optional cross-run stabilization: match newly discovered centroids to a prior topics.json.
-    if previous_topics:
+    prev_size: Dict[str, int] = {}
+    if incremental:
+        _win_end = pd.to_datetime(segments["event_time"], errors="coerce", utc=True).max()
+        topics, stability, prev_size = carry_registry(previous_topics, args.topic_max_age_days,
+                                                      _win_end)
+        if not stability.empty:
+            stability.to_csv(out_dir / "topic_stability_decisions.csv", index=False)
+            print("\nRegistry carried forward:")
+            print(stability["decision"].value_counts().to_string())
+    elif previous_topics:
         _win_end = pd.to_datetime(segments["event_time"], errors="coerce", utc=True).max()
         topics, stability = stabilize_topics(
             topics, previous_topics, threshold=args.candidate_similarity,
@@ -3498,8 +3825,7 @@ def run(args: argparse.Namespace) -> int:
             max_age_days=args.topic_max_age_days,
             window_end=_win_end,
             label_reuse_similarity=(args.label_reuse_similarity
-                                    if args.label_method == "llm" else 0.0),
-            keep_aliases=args.keep_aliases)
+                                    if args.label_method == "llm" else 0.0))
         if not stability.empty:
             stability.to_csv(out_dir / "topic_stability_decisions.csv", index=False)
             print("\nCross-run topic stability decisions:")
@@ -3516,6 +3842,7 @@ def run(args: argparse.Namespace) -> int:
             "No topics discovered. Try --min-cluster-size 10 --min-samples 5 or inspect text quality."
         )
 
+    dup_remap: Dict[str, str] = {}
     if args.merge_duplicate_topics:
         n_before = len(topics)
         topics, dup_remap = merge_duplicate_topics(topics, args.duplicate_similarity)
@@ -3528,30 +3855,91 @@ def run(args: argparse.Namespace) -> int:
 
     # Re-assign the discovery history to the now-stable topic centroids.
     # This produces the historical time series used as the baseline for hot-topic detection.
-    discovery_assignments = assign_to_topics(
-        train_segments,
-        train_embeddings,
-        topics,
-        similarity_threshold=max(0.50, args.min_similarity - 0.10),
-        multi_topic=args.max_topics_per_segment > 1,
-        max_topics_per_segment=args.max_topics_per_segment,
-        brand_scoped=args.brand_scoped_assignment,
-        secondary_margin=args.secondary_margin,
-    )
+    def _history_by_cosine(segs: pd.DataFrame, emb: np.ndarray) -> pd.DataFrame:
+        return assign_to_topics(
+            segs,
+            emb,
+            topics,
+            similarity_threshold=max(0.50, args.min_similarity - 0.10),
+            multi_topic=args.max_topics_per_segment > 1,
+            max_topics_per_segment=args.max_topics_per_segment,
+            brand_scoped=args.brand_scoped_assignment,
+            secondary_margin=args.secondary_margin,
+        )
+
+    if incremental:
+        # The history chunks were earlier batches' holdouts: keep how they were
+        # filed. Only segments those outputs never saw are filed by cosine.
+        discovery_assignments, _known = carry_history_assignments(
+            Path(args.previous_topics).resolve().parent, train_segments,
+            {t.topic_id for t in topics}, dup_remap)
+        if (~_known).any():
+            discovery_assignments = pd.concat(
+                [discovery_assignments,
+                 _history_by_cosine(train_segments[~_known].reset_index(drop=True),
+                                    train_embeddings[~_known])], ignore_index=True)
+        print(f"History: {int(_known.sum()):,} segments carried from the previous batch's "
+              f"decisions, {int((~_known).sum()):,} filed by cosine")
+    else:
+        discovery_assignments = _history_by_cosine(train_segments, train_embeddings)
 
     timer.mark("history re-assignment", f"{len(discovery_assignments):,} rows")
 
     # Incremental assignment against stable topic centroids.
-    recent_assignments = assign_to_topics(
-        recent_segments,
-        recent_embeddings,
-        topics,
-        similarity_threshold=args.min_similarity,
-        multi_topic=args.max_topics_per_segment > 1,
-        max_topics_per_segment=args.max_topics_per_segment,
-        brand_scoped=args.brand_scoped_assignment,
-        secondary_margin=args.secondary_margin,
-    )
+    matcher_info: Dict[str, object] = {"matcher": args.matcher if incremental else "centroid"}
+    if incremental:
+        matcher_info["settings"] = {
+            "decision_backend": args.decision_backend,
+            "jev_workers": int(args.jev_workers),
+            "jev_max_rpm": float(args.jev_max_rpm),
+            "gpt_posts_per_call": int(args.gpt_posts_per_call),
+            "gpt_max_options": int(args.gpt_max_options),
+            "laya_shortlist": int(args.laya_shortlist),
+            "laya_option_words": int(args.laya_option_words),
+            "laya_min_confidence": float(args.laya_min_confidence),
+            "laya_secondary_prob": float(args.laya_secondary_prob),
+            "laya_keep_suppressed": bool(args.laya_keep_suppressed),
+            "centroid_update": args.centroid_update,
+            **({"hybrid_high": float(args.hybrid_high), "hybrid_low": float(args.hybrid_low),
+                "hybrid_margin": float(args.hybrid_margin)} if args.matcher == "hybrid" else {}),
+        }
+    if incremental:
+        recent_assignments, _mstats = assign_incremental(
+            recent_segments, recent_embeddings, topics, args, args.matcher)
+        matcher_info.update(_mstats)
+        print("Matcher decisions: " + ", ".join(
+            f"{k}={v:,}" for k, v in _mstats.items()
+            if isinstance(v, int) and not isinstance(v, bool) and k != "segments"))
+        _laya = _mstats.get("laya") or {}
+        _asked = max(1, int(_mstats.get("asked_laya") or 0))
+        if _mstats.get("laya_failed_fallback", 0) / _asked > args.laya_max_failure_rate:
+            raise RuntimeError(
+                f"Laya left {_mstats['laya_failed_fallback']:,} of {_asked:,} questions unanswered "
+                f"(limit {args.laya_max_failure_rate:.0%}); last error: {_laya.get('last_error')}")
+        if _laya.get("failures"):
+            print(f"Laya: {_laya['failures']:,} call(s) failed ({_laya.get('failed_states', 0):,} "
+                  f"segments filed by cosine instead); last error: {_laya.get('last_error')}",
+                  file=sys.stderr)
+        if args.centroid_update == "running":
+            matcher_info.update(update_centroids(
+                topics, recent_assignments, recent_segments["segment_id"].tolist(),
+                recent_embeddings, prev_size,
+                args.label_reuse_similarity if args.label_method == "llm" else 0.0))
+            print(f"Centroids: {matcher_info['centroids_updated']:,} topics moved toward this "
+                  f"batch's records; {matcher_info['relabel_requested']:,} moved far enough "
+                  f"to be relabelled")
+        recent_assignments = recent_assignments.drop(columns="primary")
+    else:
+        recent_assignments = assign_to_topics(
+            recent_segments,
+            recent_embeddings,
+            topics,
+            similarity_threshold=args.min_similarity,
+            multi_topic=args.max_topics_per_segment > 1,
+            max_topics_per_segment=args.max_topics_per_segment,
+            brand_scoped=args.brand_scoped_assignment,
+            secondary_margin=args.secondary_margin,
+        )
 
     assigned = recent_assignments[recent_assignments["topic_id"].notna()].copy()
     unassigned = recent_assignments[recent_assignments["topic_id"].isna()].copy()
@@ -3581,8 +3969,10 @@ def run(args: argparse.Namespace) -> int:
                 print(f"  {int(_drop.sum()):,} already explained by the window's history; "
                       f"{len(buffer_meta):,} remain candidates")
 
-    if not unassigned.empty:
-        uids = unassigned["segment_id"].tolist()
+    # Laya's no_issue answers are unassigned but never enter the bucket.
+    to_bucket = unassigned[unassigned["assignment_type"] != NO_ISSUE_TYPE]
+    if not to_bucket.empty:
+        uids = to_bucket["segment_id"].tolist()
         seg_index = recent_segments.set_index("segment_id").loc[uids].reset_index()
         emb_lookup = {sid: i for i, sid in enumerate(recent_segments["segment_id"])}
         fresh_emb = np.asarray([recent_embeddings[emb_lookup[sid]] for sid in seg_index["segment_id"]], dtype=np.float32)
@@ -3609,6 +3999,10 @@ def run(args: argparse.Namespace) -> int:
     new_topics: List[Topic] = []
     candidate_frames = []
     absorbed = np.zeros(len(pool_meta), dtype=bool)
+    # Scheduled clustering: a brand whose bucket is still small and young waits
+    # in the buffer -- no candidate, recovery or micro pass touches it this run.
+    deferred = np.zeros(len(pool_meta), dtype=bool)
+    n_deferred_groups = 0
 
     if len(pool_meta):
         pool_counts = pool_meta.groupby("brand")["record_id"].nunique().to_dict()
@@ -3630,6 +4024,15 @@ def run(args: argparse.Namespace) -> int:
             cand_groups.append(("__SMALL_BRANDS__", np.asarray(cand_small, dtype=int)))
 
         for brand_key, gidx in cand_groups:
+            if args.bucket_trigger_size > 0 and len(gidx) < args.bucket_trigger_size:
+                _ts = pd.to_datetime(pool_meta.loc[gidx, "event_time"], errors="coerce",
+                                     utc=True, format="mixed")
+                _waited = ((latest_seen - _ts.min()) / pd.Timedelta(1, "D")
+                           if _ts.notna().any() else 0.0)
+                if _waited < args.bucket_max_wait_days:
+                    deferred[gidx] = True
+                    n_deferred_groups += 1
+                    continue
             if len(gidx) < max(15, args.min_cluster_size):
                 continue
             g_meta = pool_meta.loc[gidx].reset_index(drop=True)
@@ -3697,7 +4100,7 @@ def run(args: argparse.Namespace) -> int:
     # smaller cluster size.
     recovered_topics: List[Topic] = []
     if args.recover_unassigned and len(pool_meta):
-        rec_idx = np.where(~absorbed)[0]
+        rec_idx = np.where(~absorbed & ~deferred)[0]
         if len(rec_idx):
             rec_meta = pool_meta.loc[rec_idx].reset_index(drop=True)
             rec_emb = pool_emb[rec_idx]
@@ -3787,8 +4190,8 @@ def run(args: argparse.Namespace) -> int:
     # Micro pass over whatever the normal candidate clustering left behind.
     micro_topics: List[Topic] = []
     if args.micro_clusters and len(pool_meta):
-        left = pool_meta.loc[~absorbed]
-        left_emb = pool_emb[~absorbed]
+        left = pool_meta.loc[~absorbed & ~deferred]
+        left_emb = pool_emb[~absorbed & ~deferred]
         left = left.reset_index(drop=True)
         groups = find_micro_clusters(left, left_emb, args.micro_distance,
                                      args.micro_min_size, args.micro_min_authors)
@@ -3840,6 +4243,14 @@ def run(args: argparse.Namespace) -> int:
         print(f"Rolling buffer: {len(keep_meta):,} segments held for the next run "
               f"({int(absorbed.sum()):,} absorbed into topics this run).")
 
+    if args.bucket_trigger_size > 0:
+        print(f"Scheduled clustering: {n_deferred_groups} brand bucket(s) below "
+              f"{args.bucket_trigger_size} segments and younger than "
+              f"{args.bucket_max_wait_days:g} days wait ({int(deferred.sum()):,} segments)")
+    matcher_info["bucket"] = {"trigger_size": int(args.bucket_trigger_size),
+                              "max_wait_days": float(args.bucket_max_wait_days),
+                              "deferred_groups": int(n_deferred_groups),
+                              "deferred_segments": int(deferred.sum())}
     timer.mark("candidate discovery", f"{len(new_topics)} emerging")
 
     # Combine history + incoming data. We use distinct records for downstream counting.
@@ -3865,42 +4276,12 @@ def run(args: argparse.Namespace) -> int:
                                        args.consolidate_min_similarity, _protected)
         if plan:
             assigned = merge_topics_into(topics, assigned,
-                                         {p["merged_topic_id"]: p["into_topic_id"] for p in plan},
-                                         args.keep_aliases)
+                                         {p["merged_topic_id"]: p["into_topic_id"] for p in plan})
             merge_log.extend(plan)
         print(f"Capacity: {_n_live} live topics against a cap of {args.max_live_topics}; "
               f"{len(plan)} merged (centroid >= {args.consolidate_min_similarity}), "
               f"{_n_live - len(plan)} live now")
         timer.mark("consolidation", f"{len(plan)} merges")
-
-    # P8 idea 2 (opt-in). Record-overlap merge. With up to two topics per
-    # segment, a pair where most of the smaller topic's records also sit on the
-    # other is double-counting one issue; the overlap is direct evidence that
-    # needs no threshold in any embedding space. Done before labelling, so the
-    # LLM names the merged topic once.
-    _p8_absorbers: set = set()          # topics that absorbed in an earlier P8 step
-    _p8_cap = args.merge_max_aliases if args.keep_aliases else 0
-    if args.overlap_merge_ratio > 0:
-        _sz = (assigned[assigned["topic_id"].notna()].drop_duplicates(["record_id", "topic_id"])
-               .groupby("topic_id")["record_id"].nunique().to_dict())
-        for t in topics:
-            t.size = int(_sz.get(t.topic_id, 0))
-        _mem = topic_members(assigned)
-        _cands = []
-        for _sim, _a, _b in same_brand_pairs(topics, args.overlap_merge_similarity):
-            _c = containment(_mem, _a.topic_id, _b.topic_id)
-            if _c >= args.overlap_merge_ratio:
-                _cands.append((_c, _a, _b, {"centroid_similarity": round(_sim, 4),
-                                            "containment": round(_c, 4)}))
-        _remap, _log = plan_pair_merges(_cands, "record_overlap", _p8_absorbers, _p8_cap)
-        _p8_absorbers |= set(_remap.values())
-        if _remap:
-            assigned = merge_topics_into(topics, assigned, _remap, args.keep_aliases)
-            merge_log.extend(_log)
-        print(f"Overlap merge: {len(_remap)} same-brand topics merged ({len(_cands)} pairs with "
-              f">= {args.overlap_merge_ratio:.0%} shared records and centroid >= "
-              f"{args.overlap_merge_similarity})")
-        timer.mark("overlap merge", f"{len(_remap)} merges")
 
     # ---- Evidence per topic: members, coherence, residual flags -------------
     # Computed BEFORE labelling so the LLM can be shown them (P3), and wrapped
@@ -3910,6 +4291,22 @@ def run(args: argparse.Namespace) -> int:
     analyzer = CountVectorizer(token_pattern=r"(?u)\b[a-z][a-z']{2,}\b",
                                lowercase=True).build_analyzer()
     coherence_corpus = segments["clean_text"].astype(str).tolist()
+    # Coherence needs a corpus big enough for word pairs to co-occur: NPMI
+    # scores a pair that never co-occurs as -1. Scored against a 5k-record
+    # stream window, topics that read +0.10 on the base run fell to -0.10, and
+    # the residual flag (coherence < 0) then suppressed 44 of 76 topics in one
+    # batch, leaving four brands nothing for the matcher to offer. A fixed
+    # reference (the base run's segments) added to the window keeps one
+    # yardstick for every batch.
+    if args.coherence_reference and Path(args.coherence_reference).exists():
+        _ref = pd.read_csv(args.coherence_reference, usecols=["segment_id", "clean_text"],
+                           low_memory=False).dropna(subset=["clean_text"])
+        _ref = _ref[~_ref["segment_id"].isin(set(segments["segment_id"]))]
+        if args.coherence_reference_max and len(_ref) > args.coherence_reference_max:
+            _ref = _ref.sample(args.coherence_reference_max, random_state=42)
+        coherence_corpus += _ref["clean_text"].astype(str).tolist()
+        print(f"Coherence corpus: {len(segments):,} window segments + {len(_ref):,} reference "
+              f"segments from {args.coherence_reference}")
 
     def build_evidence(assigned: pd.DataFrame, which: Optional[set] = None):
         """Sizes, member texts, coherence, campaign and residual flags.
@@ -4092,7 +4489,7 @@ def run(args: argparse.Namespace) -> int:
         # an over-split the 0.92 centroid merge missed. The abstain token is
         # never a reason to merge: "Unclear" is not a shared subject.
         label_merges = []
-        if args.label_merge_similarity > 0 and args.label_merge_mode == "exact":
+        if args.label_merge_similarity > 0:
             groups: Dict[Tuple[str, str], List[Topic]] = {}
             for t in topics:
                 if (t.label_source in ("llm", "llm_carried") and t.label != UNCLEAR_LABEL
@@ -4108,8 +4505,6 @@ def run(args: argparse.Namespace) -> int:
                     ct = np.asarray(t.centroid, dtype=np.float32)
                     into = None
                     for k in keep_:
-                        if k.topic_id in _p8_absorbers or t.topic_id in _p8_absorbers:
-                            continue                    # P8 cross-step guard (empty by default)
                         if float(cosine_sim(ct, np.asarray(k.centroid, dtype=np.float32)[None, :])[0]) \
                                 >= args.label_merge_similarity:
                             into = k
@@ -4124,164 +4519,13 @@ def run(args: argparse.Namespace) -> int:
                                              "label": t.label, "brand": t.brand,
                                              "merged_size": t.size, "into_size": into.size})
             if remap:
-                assigned = merge_topics_into(topics, assigned, remap, args.keep_aliases)
+                assigned = merge_topics_into(topics, assigned, remap)
                 member_texts, _n_resid = build_evidence(assigned, which=set(remap.values()))
                 build_keywords(member_texts)
                 merge_log.extend(label_merges)
             print(f"Label merge: {len(remap)} same-brand topics merged into an identically "
                   f"labelled neighbour (centroid >= {args.label_merge_similarity})")
-        elif args.label_merge_similarity > 0:
-            # P8 idea 1 (opt-in). Labels matched by meaning, not by string:
-            # 'wordset' = the same content words in any order ("Flight
-            # cancellations and delays" == "Flight delays and cancellations");
-            # 'semantic' = label embeddings at least --label-merge-text-similarity.
-            # Centroids must still clear --label-merge-similarity: a shared name
-            # alone is weak evidence for generic labels.
-            _elig = lambda t: (t.label_source in ("llm", "llm_carried")
-                               and t.label != UNCLEAR_LABEL)
-            _pairs = same_brand_pairs(topics, args.label_merge_similarity, _elig)
-            _vec = (label_vectors(model, [t for t in topics if _elig(t)])
-                    if args.label_merge_mode == "semantic" else {})
-            _cands = []
-            for _sim, _a, _b in _pairs:
-                if args.label_merge_mode == "wordset":
-                    _ws = label_wordset(_a.label)
-                    _ok, _ls = bool(_ws) and _ws == label_wordset(_b.label), 1.0
-                else:
-                    _ls = float(_vec[_a.topic_id] @ _vec[_b.topic_id])
-                    _ok = _ls >= args.label_merge_text_similarity
-                if _ok:
-                    _cands.append((_ls + _sim, _a, _b, {"centroid_similarity": round(_sim, 4),
-                                                        "label_similarity": round(_ls, 4)}))
-            remap, label_merges = plan_pair_merges(_cands, f"label_{args.label_merge_mode}",
-                                                   _p8_absorbers, _p8_cap)
-            _p8_absorbers |= set(remap.values())
-            if remap:
-                assigned = merge_topics_into(topics, assigned, remap, args.keep_aliases)
-                member_texts, _n_resid = build_evidence(assigned, which=set(remap.values()))
-                build_keywords(member_texts)
-                merge_log.extend(label_merges)
-            print(f"Label merge ({args.label_merge_mode}): {len(remap)} same-brand topics merged "
-                  f"into a neighbour with a matching label (centroid >= {args.label_merge_similarity})")
         llm_info["label_merges"] = len(label_merges)
-
-        # P8 ideas 3 and 4 (opt-in): the LLM judges close pairs, then names
-        # the pairs that stay separate so they can be told apart.
-        _p8_client = None
-        if args.llm_merge_review or args.disambiguate_labels:
-            try:
-                from airouter_v1_client import AiRouterV1Client
-                _p8_client = AiRouterV1Client(model=args.label_llm_model,
-                                              use_case=args.label_llm_usecase)
-            except Exception as exc:
-                print(f"P8: LLM unavailable ({exc}); skipping review/disambiguation",
-                      file=sys.stderr)
-
-        def _p8_topic_card(t: Topic) -> Dict[str, object]:
-            return {"label": t.label, "description": t.description,
-                    "terms": list(t.keywords or [])[:10], "member_count": int(t.size or 0),
-                    "samples": [str(x)[:280] for x in label_sample(
-                        member_texts.get(t.topic_id, []), args.label_llm_samples, t.topic_id)]}
-
-        if args.llm_merge_review and _p8_client is not None:
-            from airouter_v1_client import MERGE_REVIEW_PROMPT
-            _mem = topic_members(assigned)
-            _elig = lambda t: t.label != UNCLEAR_LABEL
-            _vec = label_vectors(model, [t for t in topics if _elig(t) and (t.size or 0) > 0])
-            _pairs = []
-            for _sim, _a, _b in same_brand_pairs(topics, args.review_min_similarity, _elig):
-                _c = containment(_mem, _a.topic_id, _b.topic_id)
-                _wa, _wb = label_wordset(_a.label), label_wordset(_b.label)
-                _jac = len(_wa & _wb) / max(1, len(_wa | _wb))
-                _ls = float(_vec[_a.topic_id] @ _vec[_b.topic_id])
-                # Review only pairs with some evidence of redundancy beyond geometry.
-                if _c >= 0.25 or _jac >= 0.5 or _ls >= 0.80:
-                    _pairs.append((_sim, _a, _b, _c, _ls))
-            _pairs = _pairs[:args.review_max_pairs]
-            _answers = _p8_client.ask_json_many(
-                MERGE_REVIEW_PROMPT,
-                [{"brand": _a.brand, "topic_a": _p8_topic_card(_a), "topic_b": _p8_topic_card(_b),
-                  "shared_member_share": round(_c, 3), "centroid_similarity": round(_sim, 3)}
-                 for _sim, _a, _b, _c, _ls in _pairs],
-                workers=args.label_llm_workers)
-            _rows, _cands = [], []
-            for (_sim, _a, _b, _c, _ls), _ans in zip(_pairs, _answers):
-                _dec = str((_ans or {}).get("decision", "")).lower()
-                try:
-                    _conf = float((_ans or {}).get("confidence"))
-                except (TypeError, ValueError):
-                    _conf = None
-                _merge = _dec == "same" and _conf is not None and _conf >= args.review_min_confidence
-                _rows.append({"brand": _a.brand, "topic_a": _a.topic_id, "label_a": _a.label,
-                              "size_a": _a.size, "topic_b": _b.topic_id, "label_b": _b.label,
-                              "size_b": _b.size, "centroid_similarity": round(_sim, 4),
-                              "containment": round(_c, 4), "label_similarity": round(_ls, 4),
-                              "decision": _dec or "error", "confidence": _conf,
-                              "reason": (_ans or {}).get("reason"), "merge": _merge})
-                if _merge:
-                    _cands.append((_sim, _a, _b, {"centroid_similarity": round(_sim, 4),
-                                                  "containment": round(_c, 4),
-                                                  "llm_confidence": _conf}))
-            if _rows:
-                pd.DataFrame(_rows).to_csv(out_dir / "llm_merge_review.csv", index=False)
-            _remap, _log = plan_pair_merges(_cands, "llm_review", _p8_absorbers, _p8_cap)
-            _p8_absorbers |= set(_remap.values())
-            if _remap:
-                assigned = merge_topics_into(topics, assigned, _remap, args.keep_aliases)
-                member_texts, _n_resid = build_evidence(assigned, which=set(_remap.values()))
-                build_keywords(member_texts)
-                merge_log.extend(_log)
-            llm_info["merge_review"] = {"pairs": len(_pairs), "said_same": len(_cands),
-                                        "merged": len(_remap)}
-            print(f"LLM merge review: {len(_pairs)} pairs reviewed, {len(_cands)} judged the same "
-                  f"(confidence >= {args.review_min_confidence}), {len(_remap)} merged")
-
-        if args.disambiguate_labels and _p8_client is not None:
-            from airouter_v1_client import DISAMBIGUATE_PROMPT
-            _elig = lambda t: (t.label_source in ("llm", "llm_carried")
-                               and t.label != UNCLEAR_LABEL)
-            _vec = label_vectors(model, [t for t in topics if _elig(t) and (t.size or 0) > 0])
-            _coll = []
-            for _sim, _a, _b in same_brand_pairs(topics, -1.0, _elig):
-                _ls = float(_vec[_a.topic_id] @ _vec[_b.topic_id])
-                _same_words = label_wordset(_a.label) == label_wordset(_b.label)
-                if _ls >= args.disambiguate_similarity or _same_words:
-                    _coll.append((max(_ls, 1.0 if _same_words else 0.0), _a, _b))
-            _coll.sort(key=lambda x: -x[0])
-            _used, _jobs = set(), []
-            for _ls, _a, _b in _coll:                      # each topic renamed at most once
-                if _a.topic_id in _used or _b.topic_id in _used:
-                    continue
-                _used |= {_a.topic_id, _b.topic_id}
-                _jobs.append((_ls, _a, _b))
-            _answers = _p8_client.ask_json_many(
-                DISAMBIGUATE_PROMPT,
-                [{"brand": _a.brand, "topic_a": _p8_topic_card(_a), "topic_b": _p8_topic_card(_b)}
-                 for _ls, _a, _b in _jobs],
-                workers=args.label_llm_workers)
-            _rows, _n = [], 0
-            for (_ls, _a, _b), _ans in zip(_jobs, _answers):
-                _la = str((_ans or {}).get("label_a") or "").strip().rstrip(".")
-                _lb = str((_ans or {}).get("label_b") or "").strip().rstrip(".")
-                _ok = bool(_la and _lb and _la.lower() != _lb.lower())
-                _rows.append({"brand": _a.brand, "topic_a": _a.topic_id, "old_label_a": _a.label,
-                              "new_label_a": _la or None, "topic_b": _b.topic_id,
-                              "old_label_b": _b.label, "new_label_b": _lb or None,
-                              "label_similarity": round(_ls, 4), "applied": _ok})
-                if _ok:
-                    # label_source stays "llm" so the next batch can carry it forward.
-                    _a.label, _b.label = _la, _lb
-                    _a.description = (_ans or {}).get("description_a") or _a.description
-                    _b.description = (_ans or {}).get("description_b") or _b.description
-                    _a.label_source = _b.label_source = "llm"
-                    _n += 1
-            if _rows:
-                pd.DataFrame(_rows).to_csv(out_dir / "label_disambiguation.csv", index=False)
-            llm_info["disambiguation"] = {"colliding_pairs": len(_coll), "relabelled_pairs": _n}
-            print(f"Label disambiguation: {len(_coll)} colliding same-brand pairs, "
-                  f"{_n} pairs relabelled apart")
-        if _p8_client is not None:
-            llm_info["p8_stats"] = _p8_client.summary()
 
     if merge_log:
         _p = out_dir / "duplicate_topic_merges.csv"
@@ -4551,30 +4795,7 @@ def run(args: argparse.Namespace) -> int:
                   f"mean recall-in-best-topic {_f['recall_in_best_topic'].mean():.3f} | "
                   f"mean topics-for-80% {_f['topics_for_80pct'].mean():.1f}")
 
-    # P8 idea 5 (opt-in). Parent groups for close same-brand siblings.
-    _n_groups = None
-    if args.topic_groups:
-        _groups = build_topic_groups(topics, topic_members(assigned), args.group_min_similarity)
-        _n_groups = len(_groups)
-        if not _groups.empty:
-            _groups.sort_values("records", ascending=False) \
-                   .to_csv(out_dir / "topic_groups.csv", index=False)
-        print(f"Topic groups: {_n_groups} groups covering "
-              f"{int(_groups['topics'].sum()) if _n_groups else 0} topics "
-              f"(every pair inside a group >= {args.group_min_similarity})")
-    # P8 idea 6 (opt-in). Every absorbed ID and the topic it now resolves to.
-    if args.keep_aliases:
-        _al = [{"alias": a, "topic_id": t.topic_id, "brand": t.brand, "label": t.label}
-               for t in topics for a in (t.aliases or [])]
-        if _al:
-            pd.DataFrame(_al).to_csv(out_dir / "topic_aliases.csv", index=False)
-
-    # The P8 fields are written only when set, so a run without those flags
-    # keeps exactly the topics.json schema it always had.
-    _p8_fields = ("aliases", "group_id", "group_label", "group_size")
-    save_json(out_dir / "topics.json",
-              [{k: v for k, v in asdict(t).items() if not (k in _p8_fields and v is None)}
-               for t in topics])
+    save_json(out_dir / "topics.json", [asdict(t) for t in topics])
 
     # Drift: how far each transformed pool sat from the data the frozen manifold
     # was fitted on. Rising values are the signal to re-fit.
@@ -4594,6 +4815,8 @@ def run(args: argparse.Namespace) -> int:
     save_json(out_dir / "run_metadata.json", {
         "input_csv": args.csv,
         "embedding_model": args.model,
+        "embedding_prompt": _enc["prompt"] or None,
+        "embedding_trust_remote_code": bool(_enc["trust_remote_code"]),
         "embedding_dim": int(embeddings.shape[1]),
         "embedding_precision": "fp16" if _fp16 else "fp32",
         "embedding_device": _device,
@@ -4628,9 +4851,13 @@ def run(args: argparse.Namespace) -> int:
             "candidate_margin": float(args.candidate_margin),
             "duplicate_similarity": float(args.duplicate_similarity),
         },
+        "coherence_corpus": {"window_segments": int(len(segments)),
+                             "reference": args.coherence_reference,
+                             "total_docs": int(len(coherence_corpus))},
         "umap_drift": (None if umap_projector is None or umap_projector.drift_frame().empty
                        else round(float(umap_projector.drift_frame()["mean_dist_to_reference"].mean()), 5)),
         "previous_topics": args.previous_topics,
+        "matcher": matcher_info,
         "window": {
             "mode": "sliding" if history_files else "single-chunk",
             "history_csvs": history_files,
@@ -4658,26 +4885,6 @@ def run(args: argparse.Namespace) -> int:
             "min_similarity": float(args.consolidate_min_similarity),
             "capacity_merges": sum(1 for m in merge_log if m.get("reason") == "capacity"),
             "label_merges": sum(1 for m in merge_log if m.get("reason") == "identical_llm_label"),
-            # P8 (opt-in) merge counts and settings.
-            "label_meaning_merges": sum(1 for m in merge_log
-                                        if str(m.get("reason", "")).startswith("label_")),
-            "overlap_merges": sum(1 for m in merge_log if m.get("reason") == "record_overlap"),
-            "llm_review_merges": sum(1 for m in merge_log if m.get("reason") == "llm_review"),
-            "p8": {"label_merge_mode": args.label_merge_mode,
-                   "label_merge_text_similarity": float(args.label_merge_text_similarity),
-                   "overlap_merge_ratio": float(args.overlap_merge_ratio),
-                   "overlap_merge_similarity": float(args.overlap_merge_similarity),
-                   "llm_merge_review": bool(args.llm_merge_review),
-                   "review_min_similarity": float(args.review_min_similarity),
-                   "review_min_confidence": float(args.review_min_confidence),
-                   "disambiguate_labels": bool(args.disambiguate_labels),
-                   "disambiguate_similarity": float(args.disambiguate_similarity),
-                   "topic_groups": bool(args.topic_groups),
-                   "group_min_similarity": float(args.group_min_similarity),
-                   "groups": _n_groups,
-                   "keep_aliases": bool(args.keep_aliases),
-                   "merge_max_aliases": int(args.merge_max_aliases),
-                   "aliases": sum(len(t.aliases or []) for t in topics)},
             "retired_idle": len(retired_idle),
             "recover_match_existing": bool(args.recover_match_existing),
             "secondary_margin": float(args.secondary_margin),

@@ -1,0 +1,23 @@
+	Command being timed: "/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/.venv/bin/python run_stream.py --base-run=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/p8/disamb/base_20k --model=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/p8/disamb/models/umap.pkl --chunks /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_1.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_2.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_3.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_4.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_5.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_6.csv --window=3 --out-prefix=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/p8/disamb/stream --buffer=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/p8/disamb/buf_stream --device=cpu --embed-cache=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/slice_control/cache --extra-args=--disambiguate-labels"
+	User time (seconds): 530.06
+	System time (seconds): 5.04
+	Percent of CPU this job got: 188%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 4:44.02
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1625032
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 29
+	Minor (reclaiming a frame) page faults: 2611093
+	Voluntary context switches: 29494
+	Involuntary context switches: 41477
+	Swaps: 0
+	File system inputs: 13512
+	File system outputs: 175912
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

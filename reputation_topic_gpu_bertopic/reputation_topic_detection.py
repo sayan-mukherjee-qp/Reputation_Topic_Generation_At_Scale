@@ -2943,6 +2943,17 @@ def stabilize_topics(
         cosine_sim(np.asarray(t.centroid, dtype=np.float32), prev_matrix)
         for t in new_topics
     ])
+    # A topic belongs to the brand whose records formed it, so it can only
+    # inherit an ID (and its created_at and LLM label) from that brand's own
+    # previous topics -- always, whatever the assignment scope. Unconstrained,
+    # similar topics swapped identities across brands every batch: 95-356 per
+    # six-batch stream, e.g. T169 a MicrosoftHelps "Windows app store" topic
+    # that came back as SpotifyCares playback. A cluster with no same-brand
+    # match gets a new ID instead. The pooled buckets (__SMALL_BRANDS__,
+    # GLOBAL) are brand names too, so they still match each other.
+    new_b = np.asarray([str(t.brand) for t in new_topics])
+    prev_b = np.asarray([str(t.brand) for t in previous_topics])
+    sim_matrix = np.where(new_b[:, None] == prev_b[None, :], sim_matrix, -1.0)
 
     matched: Dict[int, int] = {}
     try:

@@ -1,0 +1,23 @@
+	Command being timed: "/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/.venv/bin/python reputation_topic_detection.py /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/twcs_subset_20k.csv --out=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/p8/baseline/base_20k --device=cpu --model=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 --min-similarity=0.50 --min-cluster-size=30 --min-samples=10 --brand-scoped-assignment --merge-duplicate-topics --duplicate-similarity=0.92 --flag-junk-topics --junk-coherence-veto=0.10 --junk-coherence-min-size=30 --micro-clusters --tweets-per-topic=-1 --label-method=llm --label-llm-samples=10 --label-llm-workers=12 --reducer=umap --umap-components=5 --umap-neighbors=30 --umap-min-dist=0.0 --umap-per-brand --umap-reference-size=50000 --cluster-selection-epsilon=0.2 --candidate-margin=0.05 --split-max-size=2500 --split-max-child-similarity=0.92 --alert-min-coherence=0.05 --alert-min-size=250 --residual-ack-ratio=0.40 --event-recall --recover-unassigned --recover-match-existing --max-live-topics=600 --consolidate-min-similarity=0.75 --umap-model=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/p8/baseline/models/umap.pkl --buffer=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/p8/baseline/buf_base --embed-cache=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/slice_control/cache"
+	User time (seconds): 79.66
+	System time (seconds): 0.73
+	Percent of CPU this job got: 205%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:39.20
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1526720
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 417709
+	Voluntary context switches: 4905
+	Involuntary context switches: 6327
+	Swaps: 0
+	File system inputs: 1280
+	File system outputs: 40248
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

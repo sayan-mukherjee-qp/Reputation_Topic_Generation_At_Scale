@@ -39,7 +39,7 @@ _VENV_PYTHON = HERE / ".venv/bin/python"
 VENV = _VENV_PYTHON if _VENV_PYTHON.exists() else Path(sys.executable)
 
 COMMON = [
-    "--model", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "--model", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
     "--min-similarity", "0.50", "--min-cluster-size", "30", "--min-samples", "10",
     "--brand-scoped-assignment",
     "--merge-duplicate-topics", "--duplicate-similarity", "0.92",
@@ -62,7 +62,9 @@ COMMON = [
     "--secondary-margin", "0",
     # EXPERIMENT (Laya copy): batches carry the registry and match incoming
     # records to it; a brand's bucket is clustered once it holds 100 segments
-    # or its oldest has waited 3 days. LAYA_BASE_URL comes from the environment.
+    # or its oldest has waited 3 days. Decisions come from TypeSafe's Jev
+    # (--decision-backend jev, default; TYPESAFE_API_KEY in .env), GPT via AI
+    # Router v1 (--decision-backend gpt) or Laya (--decision-backend laya).
     "--bucket-trigger-size", "100", "--bucket-max-wait-days", "3",
 ]
 DEFAULT_MATCHER = "laya"
@@ -198,6 +200,11 @@ def main() -> int:
     ap.add_argument("--matcher", default=DEFAULT_MATCHER, choices=["centroid", "laya", "hybrid"],
                     help="How each batch files incoming records (see reputation_topic_detection.py)")
     ap.add_argument("--laya-workers", default="4")
+    ap.add_argument("--decision-backend", default="jev", choices=["jev", "gpt", "laya"],
+                    help="Who answers the matcher's per-record questions (default jev)")
+    ap.add_argument("--gpt-workers", default="12")
+    ap.add_argument("--jev-workers", default="16")
+    ap.add_argument("--jev-max-rpm", default="1000")
     # GPU / embedding, passed straight to every batch.
     ap.add_argument("--device", default=None, help="cuda, cuda:1, cpu (default: auto)")
     ap.add_argument("--fp16", action="store_true")
@@ -228,7 +235,11 @@ def main() -> int:
                "--label-method", a.label_method,
                "--label-llm-samples", a.label_llm_samples,
                "--label-llm-workers", a.label_llm_workers,
-               "--matcher", a.matcher, "--laya-workers", a.laya_workers]
+               "--matcher", a.matcher, "--laya-workers", a.laya_workers,
+               "--decision-backend", a.decision_backend, "--gpt-workers", a.gpt_workers,
+               "--jev-workers", a.jev_workers, "--jev-max-rpm", a.jev_max_rpm,
+               # One coherence yardstick for every batch: the base run's corpus.
+               "--coherence-reference", str(Path(a.base_run) / "segments.csv")]
         if history:
             cmd += ["--history-csv", *history]
         if a.embed_cache:

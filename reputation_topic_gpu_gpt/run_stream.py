@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
 import subprocess
 import sys
 import time
@@ -40,7 +39,7 @@ _VENV_PYTHON = HERE / ".venv/bin/python"
 VENV = _VENV_PYTHON if _VENV_PYTHON.exists() else Path(sys.executable)
 
 COMMON = [
-    "--model", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "--model", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
     "--min-similarity", "0.50", "--min-cluster-size", "30", "--min-samples", "10",
     "--brand-scoped-assignment",
     "--merge-duplicate-topics", "--duplicate-similarity", "0.92",
@@ -61,7 +60,14 @@ COMMON = [
     # --secondary-margin 0.05 cut inflation 1.82x -> 1.35x but cost event
     # recall 0.508 -> 0.431 in a same-input batch-6 ablation; left off.
     "--secondary-margin", "0",
+    # EXPERIMENT (Laya copy): batches carry the registry and match incoming
+    # records to it; a brand's bucket is clustered once it holds 100 segments
+    # or its oldest has waited 3 days. Decisions come from GPT via AI Router v1
+    # (--decision-backend gpt; api_key/base_url/use_case in .env) or from Laya
+    # (--decision-backend laya; LAYA_BASE_URL in .env).
+    "--bucket-trigger-size", "100", "--bucket-max-wait-days", "3",
 ]
+DEFAULT_MATCHER = "laya"
 
 
 def unassigned_rates(run_dir, assign, hold_csv=None):
@@ -145,6 +151,19 @@ def summarise(run_dir: Path, prev_dir: Path | None) -> dict:
         "llm_tokens": ((llm.get("stats") or {}).get("prompt_tokens", 0)
                        + (llm.get("stats") or {}).get("completion_tokens", 0)) or None,
     }
+    # EXPERIMENT (Laya copies): how the matcher filed the batch's new records.
+    m = meta.get("matcher") or {}
+    row["matcher"] = m.get("matcher")
+    for k in ("asked_laya", "laya_topic", "laya_second_topic", "laya_other", "laya_no_issue",
+              "laya_low_confidence", "laya_failed_fallback", "cosine_clear", "cosine_miss",
+              "centroids_updated", "relabel_requested"):
+        if k in m:
+            row[k] = m[k]
+    if m.get("laya"):
+        row["laya_calls"] = m["laya"].get("calls")
+        row["laya_seconds"] = m["laya"].get("seconds")
+    if m.get("bucket"):
+        row["deferred_segments"] = m["bucket"].get("deferred_segments")
 
     if prev_dir is not None:
         prev_ids = {t["topic_id"] for t in json.loads((prev_dir / "topics.json").read_text())}
@@ -178,6 +197,12 @@ def main() -> int:
     ap.add_argument("--label-method", default="llm", choices=["ctfidf", "llm"])
     ap.add_argument("--label-llm-samples", default="10")
     ap.add_argument("--label-llm-workers", default="12")
+    ap.add_argument("--matcher", default=DEFAULT_MATCHER, choices=["centroid", "laya", "hybrid"],
+                    help="How each batch files incoming records (see reputation_topic_detection.py)")
+    ap.add_argument("--laya-workers", default="4")
+    ap.add_argument("--decision-backend", default="gpt", choices=["gpt", "laya"],
+                    help="Who answers the matcher's per-record questions (default gpt)")
+    ap.add_argument("--gpt-workers", default="12")
     # GPU / embedding, passed straight to every batch.
     ap.add_argument("--device", default=None, help="cuda, cuda:1, cpu (default: auto)")
     ap.add_argument("--fp16", action="store_true")
@@ -187,9 +212,6 @@ def main() -> int:
                     help="Per-chunk embedding cache. Keep it on with --window > 1: it is what "
                          "stops each chunk being re-embedded once per window it appears in. "
                          "'' disables it")
-    ap.add_argument("--extra-args", default="",
-                    help="Extra flags for every batch, as one quoted string, e.g. "
-                         "--extra-args '--overlap-merge-ratio 0.5 --keep-aliases'")
     ap.add_argument("--echo", action="store_true",
                     help="Also echo each batch's log to stdout as it runs, prefixed '  | '")
     a = ap.parse_args()
@@ -210,11 +232,13 @@ def main() -> int:
                "--umap-model", a.model, "--buffer", a.buffer] + COMMON + [
                "--label-method", a.label_method,
                "--label-llm-samples", a.label_llm_samples,
-               "--label-llm-workers", a.label_llm_workers]
+               "--label-llm-workers", a.label_llm_workers,
+               "--matcher", a.matcher, "--laya-workers", a.laya_workers,
+               "--decision-backend", a.decision_backend, "--gpt-workers", a.gpt_workers,
+               # One coherence yardstick for every batch: the base run's corpus.
+               "--coherence-reference", str(Path(a.base_run) / "segments.csv")]
         if history:
             cmd += ["--history-csv", *history]
-        if a.extra_args:
-            cmd += shlex.split(a.extra_args)
         if a.embed_cache:
             cmd += ["--embed-cache", a.embed_cache]
         if a.device:

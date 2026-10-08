@@ -38,7 +38,7 @@ def main() -> int:
     from sentence_transformers import SentenceTransformer
 
     # The image bakes one model in and runs offline; EMBEDDING_MODEL names it.
-    name = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    name = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
     model = SentenceTransformer(name, device="cuda")
     emb = model.encode(["gpu smoke test"], normalize_embeddings=True)
     print(f"sentence-transformers OK ({name}, dim={emb.shape[-1]})")

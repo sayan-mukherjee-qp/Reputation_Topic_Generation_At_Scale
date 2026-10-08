@@ -1,0 +1,23 @@
+	Command being timed: "/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/.venv/bin/python run_stream.py --base-run=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/p8/combo/base_20k --model=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/p8/combo/models/umap.pkl --chunks /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_1.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_2.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_3.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_4.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_5.csv /home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/data/stream30/chunk_6.csv --window=3 --out-prefix=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/p8/combo/stream --buffer=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/p8/combo/buf_stream --device=cpu --embed-cache=/home/sayan/Desktop/Reputation_Topic_Generation_At_Scale/reputation_topic_gpu/out/slice_control/cache --extra-args=--llm-merge-review --disambiguate-labels --keep-aliases --merge-max-aliases 3"
+	User time (seconds): 530.00
+	System time (seconds): 5.15
+	Percent of CPU this job got: 173%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 5:09.29
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1619568
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 4
+	Minor (reclaiming a frame) page faults: 2612471
+	Voluntary context switches: 32060
+	Involuntary context switches: 42653
+	Swaps: 0
+	File system inputs: 1880
+	File system outputs: 167392
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

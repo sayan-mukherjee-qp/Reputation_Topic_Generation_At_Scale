@@ -1,0 +1,55 @@
+=== [base_baseline] 2026-10-06T15:14:37+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 0:39.20
+=== [stream_baseline] 2026-10-06T15:15:16+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 4:27.34
+=== [base_wordset] 2026-10-06T15:19:43+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 0:44.43
+=== [stream_wordset] 2026-10-06T15:20:28+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 4:33.88
+=== [base_semantic] 2026-10-06T15:25:02+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 0:40.93
+=== [stream_semantic] 2026-10-06T15:25:43+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 4:31.95
+=== [base_overlap] 2026-10-06T15:30:15+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 0:40.74
+=== [stream_overlap] 2026-10-06T15:30:56+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 4:26.03
+=== [base_review] 2026-10-06T15:35:22+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 0:43.92
+=== [stream_review] 2026-10-06T15:36:06+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.21
+    FAILED rc=2
+usage: run_stream.py [-h] --base-run BASE_RUN --model MODEL --chunks CHUNKS
+                     [CHUNKS ...] [--out-prefix OUT_PREFIX] [--buffer BUFFER]
+                     [--window WINDOW] [--label-method {ctfidf,llm}]
+                     [--label-llm-samples LABEL_LLM_SAMPLES]
+                     [--label-llm-workers LABEL_LLM_WORKERS] [--device DEVICE]
+                     [--fp16] [--max-vram-gb MAX_VRAM_GB]
+                     [--batch-size BATCH_SIZE] [--embed-cache EMBED_CACHE]
+                     [--extra-args EXTRA_ARGS] [--echo]
+run_stream.py: error: argument --extra-args: expected one argument
+    (review failed; continuing)
+=== [base_disamb] 2026-10-06T15:36:06+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 0:42.30
+=== [stream_disamb] 2026-10-06T15:36:48+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.20
+    FAILED rc=2
+usage: run_stream.py [-h] --base-run BASE_RUN --model MODEL --chunks CHUNKS
+                     [CHUNKS ...] [--out-prefix OUT_PREFIX] [--buffer BUFFER]
+                     [--window WINDOW] [--label-method {ctfidf,llm}]
+                     [--label-llm-samples LABEL_LLM_SAMPLES]
+                     [--label-llm-workers LABEL_LLM_WORKERS] [--device DEVICE]
+                     [--fp16] [--max-vram-gb MAX_VRAM_GB]
+                     [--batch-size BATCH_SIZE] [--embed-cache EMBED_CACHE]
+                     [--extra-args EXTRA_ARGS] [--echo]
+run_stream.py: error: argument --extra-args: expected one argument
+    (disamb failed; continuing)
+=== [base_groups] 2026-10-06T15:36:48+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 0:40.10
+=== [stream_groups] 2026-10-06T15:37:29+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 4:41.89
+=== [base_aliases] 2026-10-06T15:42:11+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 0:38.61
+=== [stream_aliases] 2026-10-06T15:42:49+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 4:36.52
+=== ALL DONE 2026-10-06T15:47:26+05:30 ===

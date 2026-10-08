@@ -1,10 +1,10 @@
-# Two-step run: a 200k base registry, then a 300k stream replayed in batches
-# against it. GPU memory is capped IN CODE (--max-vram-gb, default 2): Docker
+# Two-step run: a 20k base registry, then a ~30k stream replayed in 6 batches of ~5k
+# against it. GPU memory is capped IN CODE (--max-vram-gb, compose default 4): Docker
 # hands a container whole GPUs and has no VRAM limit of its own.
 #
 #   docker compose build
-#   docker compose run --rm base      # 200k base run  -> ${OUT_DIR}/base_200k
-#   docker compose run --rm stream    # 300k stream    -> ${OUT_DIR}/stream_1..6
+#   docker compose run --rm base      # 20k base run   -> ${OUT_DIR}/base_20k
+#   docker compose run --rm stream    # 6 x ~5k stream -> ${OUT_DIR}/stream_1..6
 #
 # Settings, exported in the shell or set in .env beside this file:
 #   CUDA_EXTRA   cu130 (driver >= 580) | cu126 (driver >= 560) | cpu
@@ -12,23 +12,27 @@
 #                nvidia/cuda:13.4.1-devel-ubuntu24.04; see the Dockerfile header)
 #   GPU_ID       which GPU to use (default 0)
 #   MAX_VRAM_GB  whole-process VRAM cap, what nvidia-smi shows (default 2)
-#   DATA_DIR     host dir holding twcs_subset_200k.csv and stream300/chunk_*.csv
+#   DATA_DIR     host dir holding twcs_subset_20k.csv and stream30/chunk_*.csv
+#                (make_slice.py builds them from the 200k / 300k sets)
 #   OUT_DIR      host dir for every output, the UMAP model and buffers
 #   CACHE_DIR    host dir for the embedding cache (default: the topic-cache volume)
-#   BASE_CSV     base input under DATA_DIR (default twcs_subset_200k.csv)
-#   STREAM_DIR   stream chunk dir under DATA_DIR (default stream300)
-#   BASE_RUN     base run dir under OUT_DIR (default base_200k)
+#   BASE_CSV     base input under DATA_DIR (default twcs_subset_20k.csv; the full
+#                set is twcs_subset_200k.csv)
+#   STREAM_DIR   stream chunk dir under DATA_DIR (default stream30: 6 batches of
+#                ~4.9k; the full stream is stream300)
+#   BASE_RUN     base run dir under OUT_DIR (default base_20k)
 #   (make_slice.py writes a 20k/30k quick-try slice: BASE_CSV=twcs_subset_20k.csv
 #    STREAM_DIR=stream30 BASE_RUN=base_20k)
 #
 # The same .env supplies the AI Router credentials (api_key=, base_url=,
 # use_case=) to the container at run time; it is never baked into the image.
 #
-# EXPERIMENT (Laya copy): the base run is the normal pipeline; every stream
-# batch matches incoming records to the registry with Laya and clusters only
-# the misses. Set LAYA_BASE_URL (and LAYA_API_KEY if the server has one) in
-# .env. A laya-serve on this machine is http://host.docker.internal:8000 from
-# inside the container, not localhost.
+# EXPERIMENT (Jev copy): 768-dim embeddings (paraphrase-multilingual-mpnet-
+# base-v2). The base run is the normal pipeline; every stream batch matches
+# incoming records to the registry with TypeSafe's hosted Jev (TYPESAFE_API_KEY
+# in .env) and clusters only the misses. LLM labels still use AI Router v1
+# (api_key / base_url / use_case). --decision-backend gpt or laya switches the
+# decisions back to GPT or to a laya-serve at LAYA_BASE_URL.
 
 x-topics: &topics
   build:
@@ -36,8 +40,8 @@ x-topics: &topics
     args:
       CUDA_EXTRA: ${CUDA_EXTRA:-cu130}
       CUDA_BASE: ${CUDA_BASE:-nvidia/cuda:13.4.1-devel-ubuntu24.04}
-      EMBEDDING_MODEL: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-  image: reputation-topic-gpu-laya:${CUDA_EXTRA:-cu130}
+      EMBEDDING_MODEL: sentence-transformers/paraphrase-multilingual-mpnet-base-v2
+  image: reputation-topic-gpu-jev:${CUDA_EXTRA:-cu130}
   volumes:
     - ${DATA_DIR:-../data}:/data:ro
     - ${OUT_DIR:-./out_docker}:/out
@@ -78,11 +82,11 @@ services:
     <<: *topics
     command:
       - /app/reputation_topic_detection.py
-      - /data/${BASE_CSV:-twcs_subset_200k.csv}
-      - --out=/out/${BASE_RUN:-base_200k}
+      - /data/${BASE_CSV:-twcs_subset_20k.csv}
+      - --out=/out/${BASE_RUN:-base_20k}
       - --device=cuda
-      - --max-vram-gb=${MAX_VRAM_GB:-2}
-      - --model=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+      - --max-vram-gb=${MAX_VRAM_GB:-4}
+      - --model=sentence-transformers/paraphrase-multilingual-mpnet-base-v2
       - --min-similarity=0.50
       - --min-cluster-size=30
       - --min-samples=10
@@ -102,7 +106,7 @@ services:
       - --umap-neighbors=30
       - --umap-min-dist=0.0
       - --umap-per-brand
-      - --umap-model=/out/models/umap_v5_perbrand.pkl
+      - --umap-model=/out/models/umap_v6_768_perbrand.pkl
       - --umap-reference-size=50000
       - --cluster-selection-epsilon=0.2
       - --candidate-margin=0.05
@@ -127,20 +131,20 @@ services:
     <<: *topics
     command:
       - /app/run_stream.py
-      - --base-run=/out/${BASE_RUN:-base_200k}
-      - --model=/out/models/umap_v5_perbrand.pkl
+      - --base-run=/out/${BASE_RUN:-base_20k}
+      - --model=/out/models/umap_v6_768_perbrand.pkl
       - --chunks
-      - /data/${STREAM_DIR:-stream300}/chunk_1.csv
-      - /data/${STREAM_DIR:-stream300}/chunk_2.csv
-      - /data/${STREAM_DIR:-stream300}/chunk_3.csv
-      - /data/${STREAM_DIR:-stream300}/chunk_4.csv
-      - /data/${STREAM_DIR:-stream300}/chunk_5.csv
-      - /data/${STREAM_DIR:-stream300}/chunk_6.csv
+      - /data/${STREAM_DIR:-stream30}/chunk_1.csv
+      - /data/${STREAM_DIR:-stream30}/chunk_2.csv
+      - /data/${STREAM_DIR:-stream30}/chunk_3.csv
+      - /data/${STREAM_DIR:-stream30}/chunk_4.csv
+      - /data/${STREAM_DIR:-stream30}/chunk_5.csv
+      - /data/${STREAM_DIR:-stream30}/chunk_6.csv
       - --window=3
       - --out-prefix=/out/stream
       - --buffer=/out/buf_stream
       - --device=cuda
-      - --max-vram-gb=${MAX_VRAM_GB:-2}
+      - --max-vram-gb=${MAX_VRAM_GB:-4}
       - --embed-cache=/cache/embed
 
 

@@ -1,41 +1,48 @@
-# Reputation Topic Discovery — EXPERIMENT: Laya matching for every stream record
+# Reputation Topic Discovery — EXPERIMENT: GPT decisions + 768-dim embeddings
 
-> **Experimental copy of `../reputation_topic_gpu`.** The cold-start base run
-> (no `--previous-topics`) is the normal pipeline, unchanged. Every stream
-> batch changes (`--matcher laya`, the default in this copy):
+> **Experimental copy of `../reputation_topic_gpu`** (formerly the Laya copy).
+> Two changes from the Laya copy:
 >
-> - **No re-discovery.** The previous batch's registry is carried as it
->   stands: every topic starts DORMANT and revives when records land on it,
->   and is retired after `--topic-max-age-days`. The window's history chunks
->   keep the decisions earlier batches made for them, so HotScore's baseline
->   is filed the same way as the new data.
-> - **Matching.** Every incoming record is a Laya question.
->   Laya sees the record's `--laya-shortlist` (12) nearest topics of its own
->   brand plus two exits: `other` sends the record to the bucket, `no_issue`
->   leaves it unassigned and out of the bucket. A topic is accepted at
->   `answer_confidence >= --laya-min-confidence` (0.50), a second topic at
->   probability >= `--laya-secondary-prob` (0.30). Suppressed and "Unclear
->   topic" topics are not offered. Laya's options share a ~256-token budget,
->   so it cannot be shown a brand's whole registry (40-90 topics at 200k).
-> - **Centroids follow the matches** (`--centroid-update running`). A topic
->   that drifts below `--label-reuse-similarity` (0.92) from where it was
->   named is sent back to the LLM for a new label.
-> - **Scheduled clustering.** The bucket (this batch's misses plus the rolling
->   buffer) is clustered per brand once it holds `--bucket-trigger-size`
->   segments or its oldest has waited `--bucket-max-wait-days` (100 and 3 in
->   `run_stream.py`). Candidate, recovery and micro passes are unchanged.
+> 1. **Stream decisions come from GPT** (`--decision-backend gpt`, default).
+>    Every incoming record is a question -- "which of its brand's nearest
+>    topics does this post belong to, or `other` / `no_issue`?" -- answered by
+>    GPT through AI Router v1 (`gpt_decision_client.py`; credentials are the
+>    `api_key` / `base_url` / `use_case` already used for LLM labels,
+>    `AIROUTER_MODEL` picks the model, default gpt-4.1-mini). The client keeps
+>    Laya's contract -- (choice, confidence, probabilities) -- so the gates
+>    (`--laya-min-confidence` 0.50, `--laya-secondary-prob` 0.30), fallbacks
+>    and outputs are unchanged. About 20 posts of one brand share a call, each
+>    with its own shortlist (`--gpt-posts-per-call`, `--gpt-max-options`,
+>    `--gpt-workers`). GPT's confidence is its own estimate, not a calibrated
+>    probability: re-check the 0.50 gate on real data.
+>    `--decision-backend laya` restores Laya (`LAYA_BASE_URL` in `.env`).
 >
-> **Laya** is the open-weight decision model served by `laya-serve`
-> (https://github.com/NandhaKishorM/laya). Put `LAYA_BASE_URL` (and
-> `LAYA_API_KEY` if the server has one) in `.env`; see `.env.example`. From
-> inside the container a server on this machine is
-> `http://host.docker.internal:8000`. A batch checks `/health` before it
-> embeds anything and aborts if more than `--laya-max-failure-rate` (5%) of
-> its questions go unanswered; below that, unanswered records are filed by
-> cosine and marked `EXISTING_FALLBACK`. `laya_client.py` run on its own is a
-> smoke test of the endpoint.
+> 2. **768-dim embeddings**: `sentence-transformers/paraphrase-multilingual-
+>    mpnet-base-v2` through sentence-transformers (default everywhere: CLI,
+>    `run_stream.py`, Dockerfile, compose). Chosen on the 20k slice (8 Oct
+>    2026) over multilingual-e5-base, whose compressed cosine scale (random
+>    pairs 0.79 vs 0.17) collapses the tuned thresholds, and over
+>    gte-multilingual-base / nomic-embed-text-v2, whose modelling code fails
+>    under transformers 5. `--embed-prompt` and `--trust-remote-code` support
+>    other encoders (see `ENCODER_SETTINGS`). The UMAP artifact is
+>    `umap_v6_768_perbrand.pkl`; compose defaults `MAX_VRAM_GB=4` (the
+>    model's fp32 weights are 1.1 GB).
 >
-> `--matcher centroid` restores the original stream behaviour exactly.
+> 3. **Default run size: 20k base, then 6 stream batches of ~5k**
+>    (`twcs_subset_20k.csv`, `stream30/chunk_1..6`, built by `make_slice.py`;
+>    compose `BASE_CSV` / `STREAM_DIR` / `BASE_RUN`). For the full sets use
+>    `BASE_CSV=twcs_subset_200k.csv STREAM_DIR=stream300 BASE_RUN=base_200k`.
+>
+> 4. **Stream coherence uses a fixed reference** (`--coherence-reference`,
+>    passed by `run_stream.py`: the base run's `segments.csv`, up to 50k
+>    sampled). Scored against a ~5k-record window alone, NPMI drove topics
+>    that read +0.10 on the base run to -0.10, the residual flag suppressed 44
+>    of 76 topics in one batch, and four brands were left with nothing for the
+>    matcher to offer.
+>
+> Cost guide for GPT decisions: about 2-3k tokens per call of 20 posts, so a
+> 49k-record batch is ~2.5k calls. `--matcher hybrid` lets cosine settle the
+> clear cases and asks GPT only about the borderline band.
 
 ## Original README
 

@@ -52,7 +52,7 @@ MENTION_RE = re.compile(r"(?<!\w)@\w+")
 WHITESPACE_RE = re.compile(r"\s+")
 MULTI_PUNCT_RE = re.compile(r"([!?.,])\1{2,}")
 
-DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
 # Peak GPU memory the embedding stage may touch, in GiB. Nothing else in the
 # pipeline uses the GPU -- UMAP is umap-learn/numba and HDBSCAN is sklearn, both
@@ -251,6 +251,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--brand-col", default="brand")
     p.add_argument("--id-col", default="tweet_id")
     p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--embed-prompt", default="auto",
+                   help="Text prefix the encoder expects, e.g. 'query: ' for multilingual-e5. "
+                        "'auto' (default) looks the model up in ENCODER_SETTINGS; '' disables")
+    p.add_argument("--trust-remote-code", default=None, action="store_true",
+                   help="Allow the model's own modelling code (needed by gte-multilingual and "
+                        "nomic-embed-v2). Default: on for models listed in ENCODER_SETTINGS")
     p.add_argument("--min-cluster-size", type=int, default=20)
     p.add_argument("--min-samples", type=int, default=8)
     p.add_argument("--min-similarity", type=float, default=0.68)
@@ -380,6 +386,12 @@ def parse_args() -> argparse.Namespace:
                     help="Layer 3: never flag on coherence alone below this many records. NPMI is "
                          "unreliable on small samples, and demoting small topics suppresses exactly "
                          "the emerging signal the buffer exists to surface")
+    p.add_argument("--coherence-reference", default=None,
+                    help="segments.csv of a reference run (run_stream.py passes the base run's) whose "
+                         "texts are added to the window when scoring coherence, so a small stream "
+                         "window cannot drive good topics negative")
+    p.add_argument("--coherence-reference-max", type=int, default=50000,
+                    help="Most reference segments added (seeded sample); bounds the cost at scale")
     p.add_argument("--no-coherence", action="store_true",
                     help="Skip inline coherence scoring (saves 1-2 minutes)")
     p.add_argument("--pca-components", type=int, default=50,
@@ -505,6 +517,17 @@ def parse_args() -> argparse.Namespace:
                    help="A second topic is assigned when Laya gives it at least this probability "
                         "(up to --max-topics-per-segment).")
     p.add_argument("--laya-workers", type=int, default=4, help="Concurrent Laya requests.")
+    p.add_argument("--decision-backend", default="gpt", choices=["gpt", "laya"],
+                   help="Who answers the matcher's per-record questions (matcher 'laya' and "
+                        "'hybrid'). 'gpt' (default): GPT through AI Router v1 (api_key / base_url / "
+                        "use_case in .env, AIROUTER_MODEL picks the model). 'laya': the Laya "
+                        "decision model at LAYA_BASE_URL. Same options, gates and fallbacks")
+    p.add_argument("--gpt-posts-per-call", type=int, default=20,
+                   help="gpt backend: posts of one brand answered per call, each with its own shortlist")
+    p.add_argument("--gpt-max-options", type=int, default=40,
+                   help="gpt backend: most distinct topics one call may carry (the union of its "
+                        "posts' shortlists)")
+    p.add_argument("--gpt-workers", type=int, default=12, help="gpt backend: concurrent calls")
     p.add_argument("--laya-max-failure-rate", type=float, default=0.05,
                    help="Abort the batch when more than this share of Laya questions went "
                         "unanswered. Below it, unanswered segments are filed by cosine and "
@@ -558,7 +581,7 @@ def build_content_stopset() -> frozenset:
 
 def acknowledgement_similarity(model: SentenceTransformer, embeddings: np.ndarray) -> np.ndarray:
     """Max cosine similarity of each row to any acknowledgement anchor."""
-    anchors = model.encode(ACK_ANCHORS, normalize_embeddings=True,
+    anchors = model.encode(ACK_ANCHORS, prompt=encode_prompt(model), normalize_embeddings=True,
                            convert_to_numpy=True).astype(np.float32)
     return (embeddings @ anchors.T).max(axis=1)
 
@@ -961,7 +984,8 @@ class VramGuard:
         # A few batches of realistic length pull in every kernel and library
         # handle the real run will use.
         warm = ["customer support " * 40] * 8
-        model.encode(warm, batch_size=8, show_progress_bar=False, convert_to_numpy=True)
+        model.encode(warm, prompt=encode_prompt(model), batch_size=8, show_progress_bar=False,
+                     convert_to_numpy=True)
         torch.cuda.synchronize(self.idx)
         torch.cuda.empty_cache()
         reserved = int(torch.cuda.memory_reserved(self.idx))
@@ -1057,7 +1081,8 @@ def choose_batch_size(
     peak = None
     while peak is None:
         try:
-            model.encode([texts[i] for i in longest[:probe_n]], batch_size=probe_n,
+            model.encode([texts[i] for i in longest[:probe_n]], prompt=encode_prompt(model),
+                         batch_size=probe_n,
                          show_progress_bar=False, normalize_embeddings=True,
                          convert_to_numpy=True)
             torch.cuda.synchronize(idx)
@@ -1096,6 +1121,7 @@ def _encode(model: SentenceTransformer, texts: Sequence[str], batch_size: int,
             progress: bool) -> np.ndarray:
     emb = model.encode(
         list(texts),
+        prompt=encode_prompt(model),
         batch_size=batch_size,
         show_progress_bar=progress,
         normalize_embeddings=True,
@@ -1117,11 +1143,44 @@ def describe_device(device: str) -> str:
         return device
 
 
-def load_embedding_model(model_name: str, device: str, fp16: bool = False) -> SentenceTransformer:
-    model = SentenceTransformer(model_name, device=device)
+# Encoder settings for models that need them. A prompt is the text prefix the
+# model was trained to expect for this kind of task (symmetric similarity /
+# clustering here); remote code is the model's own modelling file.
+ENCODER_SETTINGS = {
+    "intfloat/multilingual-e5-base": {"prompt": "query: ", "trust_remote_code": False},
+    "Alibaba-NLP/gte-multilingual-base": {"prompt": "", "trust_remote_code": True},
+    "nomic-ai/nomic-embed-text-v2-moe": {"prompt": "clustering: ", "trust_remote_code": True},
+}
+# Tested on the 20k slice (8 Oct 2026): mpnet (the default) works with every
+# tuned similarity threshold. multilingual-e5-base embeds ~27% faster but its
+# cosine scale is compressed -- random tweet pairs score 0.79 (mpnet 0.17) --
+# so the 0.92 duplicate merge collapsed 62 topics into 12; it needs every
+# threshold recalibrated first. gte-multilingual-base and nomic-embed-text-v2
+# ship modelling code that fails under transformers 5.
+
+
+def encoder_settings(model_name: str, prompt: str = "auto",
+                     trust_remote_code: Optional[bool] = None) -> Dict[str, object]:
+    """Resolve --embed-prompt / --trust-remote-code against the known-model table."""
+    known = ENCODER_SETTINGS.get(model_name, {})
+    return {"prompt": known.get("prompt", "") if prompt == "auto" else prompt,
+            "trust_remote_code": (bool(known.get("trust_remote_code", False))
+                                  if trust_remote_code is None else bool(trust_remote_code))}
+
+
+def load_embedding_model(model_name: str, device: str, fp16: bool = False,
+                         prompt: str = "", trust_remote_code: bool = False) -> SentenceTransformer:
+    model = SentenceTransformer(model_name, device=device, trust_remote_code=trust_remote_code)
     if fp16 and str(device).startswith("cuda"):
         model = model.half()
+    # Every encode call reads this, so the prefix cannot be applied to some
+    # texts (the corpus) and forgotten for others (anchors, probes).
+    model._rtd_prompt = prompt or None
     return model
+
+
+def encode_prompt(model) -> Optional[str]:
+    return getattr(model, "_rtd_prompt", None)
 
 
 def build_embeddings(model: SentenceTransformer, texts: Sequence[str], batch_size: int = 64,
@@ -2198,6 +2257,17 @@ def laya_eligible(topics: List[Topic], keep_suppressed: bool) -> np.ndarray:
     return np.asarray([not t.suppressed and t.label != UNCLEAR_LABEL for t in topics], dtype=bool)
 
 
+def make_decision_client(args):
+    """The configured decision backend and its worker count (same decide() contract)."""
+    if getattr(args, "decision_backend", "gpt") == "gpt":
+        from gpt_decision_client import GptDecisionClient
+        return (GptDecisionClient(posts_per_call=args.gpt_posts_per_call,
+                                  max_options=args.gpt_max_options), args.gpt_workers)
+    from laya_client import LayaClient
+    return (LayaClient(min_confidence=None, max_len=args.laya_max_len,
+                       head_max_len=args.laya_head_max_len), args.laya_workers)
+
+
 def assign_incremental(
     segments: pd.DataFrame,
     embeddings: np.ndarray,
@@ -2223,7 +2293,7 @@ def assign_incremental(
     Returns the assignment frame (assign_to_topics' columns plus `primary`,
     True on each segment's first topic) and counts for run_metadata.json.
     """
-    from laya_client import LayaClient, NO_ISSUE_KEY, NO_ISSUE_TEXT, OTHER_KEY, OTHER_TEXT
+    from laya_client import NO_ISSUE_KEY, NO_ISSUE_TEXT, OTHER_KEY, OTHER_TEXT
 
     cols = ["record_id", "segment_id", "segment_index", "event_time", "brand", "clean_text"]
     stats: Dict[str, object] = {"mode": mode, "segments": int(len(segments))}
@@ -2278,10 +2348,9 @@ def assign_incremental(
 
     decisions: List[Optional[tuple]] = []
     if requests:
-        client = LayaClient(min_confidence=None, max_len=args.laya_max_len,
-                            head_max_len=args.laya_head_max_len)
+        client, workers = make_decision_client(args)
         t0 = time.perf_counter()
-        decisions = client.decide(requests, workers=args.laya_workers)
+        decisions = client.decide(requests, workers=workers)
         stats["laya"] = {**client.config(), **client.summary(),
                          "seconds": round(time.perf_counter() - t0, 1)}
     decision_of = dict(zip(ask_rows.tolist(), decisions))
@@ -3240,7 +3309,6 @@ def stabilize_topics(
     max_age_days: int = 0,
     window_end: Optional[pd.Timestamp] = None,
     label_reuse_similarity: float = 0.0,
-    brand_scoped: bool = False,
 ) -> Tuple[List[Topic], pd.DataFrame]:
     """Match newly discovered clusters to previous topics by original-space centroid similarity.
 
@@ -3271,16 +3339,17 @@ def stabilize_topics(
         cosine_sim(np.asarray(t.centroid, dtype=np.float32), prev_matrix)
         for t in new_topics
     ])
-    if brand_scoped:
-        # A topic belongs to the brand whose records formed it, so it can only
-        # inherit an ID (and its created_at and LLM label) from that brand's
-        # own previous topics. Unscoped, similar topics swapped identities
-        # across brands every batch -- 12 to 34 per batch on the 300k stream,
-        # e.g. T46 "Flight delays and baggage wait times" bouncing between
-        # Delta and AmericanAir.
-        new_b = np.asarray([str(t.brand) for t in new_topics])
-        prev_b = np.asarray([str(t.brand) for t in previous_topics])
-        sim_matrix = np.where(new_b[:, None] == prev_b[None, :], sim_matrix, -1.0)
+    # A topic belongs to the brand whose records formed it, so it can only
+    # inherit an ID (and its created_at and LLM label) from that brand's own
+    # previous topics -- always, whatever the assignment scope. Unconstrained,
+    # similar topics swapped identities across brands every batch: 95-356 per
+    # six-batch stream, e.g. T169 a MicrosoftHelps "Windows app store" topic
+    # that came back as SpotifyCares playback. A cluster with no same-brand
+    # match gets a new ID instead. The pooled buckets (__SMALL_BRANDS__,
+    # GLOBAL) are brand names too, so they still match each other.
+    new_b = np.asarray([str(t.brand) for t in new_topics])
+    prev_b = np.asarray([str(t.brand) for t in previous_topics])
+    sim_matrix = np.where(new_b[:, None] == prev_b[None, :], sim_matrix, -1.0)
 
     matched: Dict[int, int] = {}
     try:
@@ -3413,10 +3482,9 @@ def run(args: argparse.Namespace) -> int:
     # --previous-topics) is the normal pipeline.
     incremental = args.matcher != "centroid" and bool(previous_topics)
     if incremental:
-        from laya_client import LayaClient
-        LayaClient().health()          # fail here, not after the embedding stage
-        print(f"Matcher: {args.matcher} -- registry of {len(previous_topics)} topics carried, "
-              f"not re-discovered")
+        make_decision_client(args)[0].health()   # fail here, not after the embedding stage
+        print(f"Matcher: {args.matcher} ({args.decision_backend} decisions) -- registry of "
+              f"{len(previous_topics)} topics carried, not re-discovered")
 
     # Sliding window (P2 of the out300 review). History chunks are loaded and
     # segmented one file at a time, exactly as a single-chunk run would, so
@@ -3492,7 +3560,9 @@ def run(args: argparse.Namespace) -> int:
         _bounds = np.cumsum([0] + part_sizes)
         _slices = list(zip(_bounds[:-1].tolist(), _bounds[1:].tolist()))
 
-    model = load_embedding_model(args.model, _device, _fp16)
+    _enc = encoder_settings(args.model, args.embed_prompt, args.trust_remote_code)
+    model = load_embedding_model(args.model, _device, _fp16, _enc["prompt"],
+                                 _enc["trust_remote_code"])
     _guard = None
     if _vram_budget is not None:
         _guard = VramGuard(_device, _max_vram)
@@ -3502,7 +3572,9 @@ def run(args: argparse.Namespace) -> int:
     _emb_parts, _n_cached, _n_fresh, _emb_dt = [], 0, 0, 0.0
     for lo, hi in _slices:
         _texts = _all_texts[lo:hi]
-        _key = embedding_cache_key(args.model, _texts, _prec)
+        # The prompt changes every vector, so it is part of the cache identity.
+        _key = embedding_cache_key(args.model + (f"|prompt={_enc['prompt']}" if _enc["prompt"] else ""),
+                                   _texts, _prec)
         e = load_cached_embeddings(args.embed_cache, _key)
         if e is not None and len(e) == len(_texts):
             _n_cached += len(_texts)
@@ -3745,8 +3817,7 @@ def run(args: argparse.Namespace) -> int:
             max_age_days=args.topic_max_age_days,
             window_end=_win_end,
             label_reuse_similarity=(args.label_reuse_similarity
-                                    if args.label_method == "llm" else 0.0),
-            brand_scoped=args.brand_scoped_assignment)
+                                    if args.label_method == "llm" else 0.0))
         if not stability.empty:
             stability.to_csv(out_dir / "topic_stability_decisions.csv", index=False)
             print("\nCross-run topic stability decisions:")
@@ -3810,6 +3881,9 @@ def run(args: argparse.Namespace) -> int:
     matcher_info: Dict[str, object] = {"matcher": args.matcher if incremental else "centroid"}
     if incremental:
         matcher_info["settings"] = {
+            "decision_backend": args.decision_backend,
+            "gpt_posts_per_call": int(args.gpt_posts_per_call),
+            "gpt_max_options": int(args.gpt_max_options),
             "laya_shortlist": int(args.laya_shortlist),
             "laya_option_words": int(args.laya_option_words),
             "laya_min_confidence": float(args.laya_min_confidence),
@@ -4207,6 +4281,22 @@ def run(args: argparse.Namespace) -> int:
     analyzer = CountVectorizer(token_pattern=r"(?u)\b[a-z][a-z']{2,}\b",
                                lowercase=True).build_analyzer()
     coherence_corpus = segments["clean_text"].astype(str).tolist()
+    # Coherence needs a corpus big enough for word pairs to co-occur: NPMI
+    # scores a pair that never co-occurs as -1. Scored against a 5k-record
+    # stream window, topics that read +0.10 on the base run fell to -0.10, and
+    # the residual flag (coherence < 0) then suppressed 44 of 76 topics in one
+    # batch, leaving four brands nothing for the matcher to offer. A fixed
+    # reference (the base run's segments) added to the window keeps one
+    # yardstick for every batch.
+    if args.coherence_reference and Path(args.coherence_reference).exists():
+        _ref = pd.read_csv(args.coherence_reference, usecols=["segment_id", "clean_text"],
+                           low_memory=False).dropna(subset=["clean_text"])
+        _ref = _ref[~_ref["segment_id"].isin(set(segments["segment_id"]))]
+        if args.coherence_reference_max and len(_ref) > args.coherence_reference_max:
+            _ref = _ref.sample(args.coherence_reference_max, random_state=42)
+        coherence_corpus += _ref["clean_text"].astype(str).tolist()
+        print(f"Coherence corpus: {len(segments):,} window segments + {len(_ref):,} reference "
+              f"segments from {args.coherence_reference}")
 
     def build_evidence(assigned: pd.DataFrame, which: Optional[set] = None):
         """Sizes, member texts, coherence, campaign and residual flags.
@@ -4715,6 +4805,8 @@ def run(args: argparse.Namespace) -> int:
     save_json(out_dir / "run_metadata.json", {
         "input_csv": args.csv,
         "embedding_model": args.model,
+        "embedding_prompt": _enc["prompt"] or None,
+        "embedding_trust_remote_code": bool(_enc["trust_remote_code"]),
         "embedding_dim": int(embeddings.shape[1]),
         "embedding_precision": "fp16" if _fp16 else "fp32",
         "embedding_device": _device,
@@ -4749,6 +4841,9 @@ def run(args: argparse.Namespace) -> int:
             "candidate_margin": float(args.candidate_margin),
             "duplicate_similarity": float(args.duplicate_similarity),
         },
+        "coherence_corpus": {"window_segments": int(len(segments)),
+                             "reference": args.coherence_reference,
+                             "total_docs": int(len(coherence_corpus))},
         "umap_drift": (None if umap_projector is None or umap_projector.drift_frame().empty
                        else round(float(umap_projector.drift_frame()["mean_dist_to_reference"].mean()), 5)),
         "previous_topics": args.previous_topics,

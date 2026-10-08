@@ -216,7 +216,7 @@ class AiRouterV1Client:
             st["latency_p95_s"] = round(lat[min(len(lat) - 1, int(0.95 * len(lat)))], 3)
         return st
 
-    def _run(self, prompt: str, content: str) -> dict:
+    def _run(self, prompt: str, content: str, max_tokens: int = MAX_TOKENS) -> dict:
         payload = json.dumps({
             "use_case_name": self.use_case,
             "user_id": self.user_id,
@@ -224,7 +224,7 @@ class AiRouterV1Client:
             "data_center": "US",
             "model": self.model,
             "prompt_template": prompt,
-            "params": {"temperature": TEMPERATURE, "max_tokens": MAX_TOKENS},
+            "params": {"temperature": TEMPERATURE, "max_tokens": max_tokens},
             "input_data": {
                 "messages": [{"key": "content", "value": content}],
                 "response_format": {"type": "json_object"},

@@ -140,83 +140,6 @@ Return only this JSON object, nothing else:
  "confidence": <0.0-1.0>}
 """
 
-# P8 (near-duplicate topics). Two prompts for same-brand topic pairs that
-# survived every geometric merge: one asks whether a pair is the same issue,
-# the other gives two separate-but-similar topics labels that tell them apart.
-MERGE_REVIEW_PROMPT_VERSION = "topic-merge-review-v1"
-
-MERGE_REVIEW_PROMPT = """\
-You review topic pairs for a brand reputation monitoring system.
-
-You receive two topics discovered by clustering customer tweets sent to ONE
-brand. The input is a JSON object with:
-  - brand
-  - topic_a, topic_b: each with label, description, terms, member_count and
-    samples (a RANDOM sample of real tweets from that topic)
-  - shared_member_share: share of the smaller topic's tweets that were also
-    assigned to the other topic (0 to 1)
-  - centroid_similarity: cosine similarity of the two topics' embeddings
-
-Decide whether the two topics describe the SAME customer issue, so a reputation
-analyst would want them reported as ONE topic.
-
-RULES
-
-1. Judge the tweets, not the labels. Labels can be wrong in either direction.
-2. "same" means an analyst acting on one topic would be acting on the other:
-   the same complaint, product, feature, route or request. Different wording,
-   language or tone about the same issue is still "same".
-3. "different" when the topics share a broad area but differ in the issue
-   customers raise, for example "flight delays" vs "seat assignment fees", or
-   "billing errors" vs "plan upgrades".
-4. If one topic is a mixed bag that only partly overlaps the other, answer
-   "different".
-5. Give "confidence" from 0 to 1. Below 0.6 when you are unsure.
-
-OUTPUT
-
-Return only this JSON object, nothing else:
-
-{"decision": "same" | "different",
- "confidence": <0.0-1.0>,
- "reason": "<one short sentence>"}
-"""
-
-DISAMBIGUATE_PROMPT_VERSION = "topic-disambiguate-v1"
-
-DISAMBIGUATE_PROMPT = """\
-You name customer-feedback topics for a brand reputation monitoring system.
-
-You receive two topics for ONE brand that currently have the same or nearly
-the same name, but which the system keeps as separate topics. The input is a
-JSON object with brand, and topic_a and topic_b, each with its current label,
-description, terms and samples (a RANDOM sample of real tweets).
-
-Give each topic a new name that says what is DIFFERENT about it, so an analyst
-seeing both names side by side can tell them apart.
-
-RULES
-
-1. Each name must describe that topic's own samples. Never move a subject
-   from one topic to the other, and never invent a cause, product, route or
-   version that is not in its tweets.
-2. Two to six words, a noun phrase in sentence case, English, no brand name,
-   no trailing punctuation.
-3. The two names must not share their main noun phrase. If both topics are
-   about flight delays, say what differs: the consequence, the cause, the
-   stage of the journey, or what customers ask for.
-4. If one topic is broad and the other specific, name the broad one by its
-   broader subject and the specific one by its specific issue.
-5. Write a one-sentence description (at most 30 words) for each.
-
-OUTPUT
-
-Return only this JSON object, nothing else:
-
-{"label_a": "<name>", "description_a": "<sentence>",
- "label_b": "<name>", "description_b": "<sentence>"}
-"""
-
 TEMPERATURE = 0
 MAX_TOKENS = 220
 
@@ -387,51 +310,6 @@ class AiRouterV1Client:
         except (TypeError, ValueError):
             conf = None
         return label, desc, (sub if isinstance(sub, bool) else None), conf
-
-    @staticmethod
-    def _parse_json(body: dict) -> Optional[dict]:
-        """The first JSON object in the response, whatever its keys."""
-        docs = ((body or {}).get("result") or {}).get("documents") or []
-        for doc in docs:
-            for item in doc.get("output") or []:
-                if not isinstance(item, dict) or item.get("key") == "reasoning":
-                    continue
-                value = item.get("value")
-                if isinstance(value, str):
-                    try:
-                        value = json.loads(value)
-                    except json.JSONDecodeError:
-                        continue
-                if isinstance(value, dict):
-                    return value
-        return None
-
-    def ask_json(self, prompt: str, payload: dict, max_tokens: int = 300) -> Optional[dict]:
-        """One call with any prompt; the parsed JSON answer, or None. Never raises."""
-        self._bump(calls=1)
-        try:
-            parsed = self._parse_json(self._run(prompt, json.dumps(payload, ensure_ascii=False),
-                                                max_tokens=max_tokens))
-        except Exception as exc:
-            self._bump(failures=1)
-            with self._lock:
-                self.last_error = f"{type(exc).__name__}: {exc}"[:300]
-            return None
-        if not parsed:
-            self._bump(failures=1, parse_failures=1)
-            return None
-        self._bump(ok=1)
-        return parsed
-
-    def ask_json_many(self, prompt: str, payloads: Sequence[dict], workers: int = 8,
-                      max_tokens: int = 300) -> List[Optional[dict]]:
-        """ask_json over payloads in parallel, order kept, misses retried once."""
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            results = list(pool.map(lambda p: self.ask_json(prompt, p, max_tokens), payloads))
-        for i, res in enumerate(results):
-            if res is None:
-                results[i] = self.ask_json(prompt, payloads[i], max_tokens)
-        return results
 
     def label_topics(self, items: Sequence[Tuple[str, Sequence[str], Sequence[str], Optional[dict]]],
                      workers: int = 8) -> List[Optional[LabelResult]]:

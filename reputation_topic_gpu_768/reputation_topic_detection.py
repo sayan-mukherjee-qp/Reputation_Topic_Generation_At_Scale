@@ -2842,7 +2842,6 @@ def stabilize_topics(
     max_age_days: int = 0,
     window_end: Optional[pd.Timestamp] = None,
     label_reuse_similarity: float = 0.0,
-    brand_scoped: bool = False,
 ) -> Tuple[List[Topic], pd.DataFrame]:
     """Match newly discovered clusters to previous topics by original-space centroid similarity.
 
@@ -2873,16 +2872,17 @@ def stabilize_topics(
         cosine_sim(np.asarray(t.centroid, dtype=np.float32), prev_matrix)
         for t in new_topics
     ])
-    if brand_scoped:
-        # A topic belongs to the brand whose records formed it, so it can only
-        # inherit an ID (and its created_at and LLM label) from that brand's
-        # own previous topics. Unscoped, similar topics swapped identities
-        # across brands every batch -- 12 to 34 per batch on the 300k stream,
-        # e.g. T46 "Flight delays and baggage wait times" bouncing between
-        # Delta and AmericanAir.
-        new_b = np.asarray([str(t.brand) for t in new_topics])
-        prev_b = np.asarray([str(t.brand) for t in previous_topics])
-        sim_matrix = np.where(new_b[:, None] == prev_b[None, :], sim_matrix, -1.0)
+    # A topic belongs to the brand whose records formed it, so it can only
+    # inherit an ID (and its created_at and LLM label) from that brand's own
+    # previous topics -- always, whatever the assignment scope. Unconstrained,
+    # similar topics swapped identities across brands every batch: 95-356 per
+    # six-batch stream, e.g. T169 a MicrosoftHelps "Windows app store" topic
+    # that came back as SpotifyCares playback. A cluster with no same-brand
+    # match gets a new ID instead. The pooled buckets (__SMALL_BRANDS__,
+    # GLOBAL) are brand names too, so they still match each other.
+    new_b = np.asarray([str(t.brand) for t in new_topics])
+    prev_b = np.asarray([str(t.brand) for t in previous_topics])
+    sim_matrix = np.where(new_b[:, None] == prev_b[None, :], sim_matrix, -1.0)
 
     matched: Dict[int, int] = {}
     try:
@@ -3317,8 +3317,7 @@ def run(args: argparse.Namespace) -> int:
             max_age_days=args.topic_max_age_days,
             window_end=_win_end,
             label_reuse_similarity=(args.label_reuse_similarity
-                                    if args.label_method == "llm" else 0.0),
-            brand_scoped=args.brand_scoped_assignment)
+                                    if args.label_method == "llm" else 0.0))
         if not stability.empty:
             stability.to_csv(out_dir / "topic_stability_decisions.csv", index=False)
             print("\nCross-run topic stability decisions:")

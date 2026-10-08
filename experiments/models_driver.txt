@@ -1,0 +1,5 @@
+=== [minilm] 2026-10-08T16:07:44+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 2:02.39
+=== [mpnet] 2026-10-08T16:09:46+05:30 ===
+    Elapsed (wall clock) time (h:mm:ss or m:ss): 1:51.73
+=== [e5] 2026-10-08T16:11:38+05:30 ===

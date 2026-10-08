@@ -80,7 +80,7 @@ USER app
 # Bake the embedding model in so a run needs no network access. This is the
 # multilingual model every run in this repo uses (docker-compose.yml passes it
 # too); the corpus mixes English, Spanish, French, German and Japanese.
-ARG EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+ARG EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-mpnet-base-v2
 # Kept as ENV so gpu_check.py loads the model that is actually baked in.
 ENV EMBEDDING_MODEL=${EMBEDDING_MODEL}
 RUN python -c "\

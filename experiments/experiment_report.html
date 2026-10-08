@@ -131,7 +131,7 @@ footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
 <header class="top">
   <div class="eyebrow">Reputation topic generation · experiment log · 30 Sep 2026</div>
   <h1>768-dim embeddings and BERTopic against the current pipeline</h1>
-  <p class="lede prose">Two experimental copies of <code>reputation_topic_gpu</code>, each run on the 200k base corpus and then the 300k stream, compared with the unchanged code re-run on the same machine. All four runs are in, plus a slice test of the tuned 768 copy (Report 5).</p>
+  <p class="lede prose">Two experimental copies of <code>reputation_topic_gpu</code>, each run on the 200k base corpus and then the 300k stream, compared with the unchanged code re-run on the same machine. All four runs are in, plus a slice test of the tuned 768 copy (Report 5) and the duplicate-topic experiments (Report 6).</p>
   <div class="meta-row">
     <span>Intel Core 7 150U · 12 threads · 31 GiB · CPU only</span>
     <span>torch 2.14.0 · umap-learn 0.5.12 · sklearn 1.9.1 · bertopic 0.17.4</span>
@@ -147,6 +147,7 @@ footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
     <li><a href="#rbts">BERTopic · 300k stream</a><span class="status done">done</span></li>
     <li><a href="#r768s">768-dim · 300k stream</a><span class="status done">done</span></li>
     <li><a href="#rslice">Tuned 768 · 20k slice</a><span class="status done">done</span></li>
+    <li><a href="#rdup">Duplicate topics · 6 ideas</a><span class="status done">done</span></li>
   </ol>
 </nav>
 
@@ -636,6 +637,101 @@ footer { padding-top: 26px; font-size: 0.84rem; color: var(--ink-3); }
       <li>Double-counting stays the one open trade-off with 768 (1.65 vs 1.50 on the slice). If it matters more than coherence, <code>--thresholds floors</code> is the mildest fix (1.58) at a coherence cost.</li>
       <li>On this CPU the 768 encoder ran at about 35 segments a second, 3.7–4.0× slower than MiniLM. The GPU run will show whether that ratio holds.</li>
     </ul>
+  </div>
+</section>
+
+
+<!-- ======================================================= P8 duplicate topics -->
+<section class="report" id="rdup">
+  <div class="eyebrow">Report 6 · near-duplicate topics · 20k base + 30k stream · 6 Oct 2026</div>
+  <h2>Same-brand duplicate topics: six fixes tested</h2>
+  <div class="prose">
+    <p><strong>Four of the six ideas work, one works only with guards added during testing, and one does not work. The best combination merges topics that share most of their records or have the same label meaning, renames the pairs that stay separate, and keeps merged IDs as aliases. On the stream it removed every duplicate label, cut double-counting from 1.50 to 1.39 and raised event recall from 0.729 to 0.779 at slightly lower LLM cost.</strong></p>
+    <p>The starting case: AmericanAir T8 "Flight cancellations and delays" and T11 "Flight delays and cancellations" in the 20k run. Their centroids sit at 0.80 (the duplicate merge needs 0.92). The labels differ only in word order (the label merge needs identical text). 61% of T11's records are also counted in T8. The tweets show T8 is the broader "flight experience" topic (seats, fees, gates) and T11 is about delays and missed connections.</p>
+  </div>
+
+  <h3>How it was tested</h3>
+  <div class="prose">
+    <p>All ideas are new flags in <code>reputation_topic_gpu</code>, <strong>off by default</strong>, so current behaviour is unchanged. Each version ran the 20k base plus the six-batch 30k stream with the same frozen UMAP model and cached embeddings, so discovery was identical and only the idea under test differed. Every merge in the base runs was sent to an LLM judge. The judge saw the two topics as they were before the merge and was asked "same issue or different?". The review version is excluded from judging because the same LLM would be grading itself.</p>
+  </div>
+  <div class="tbl"><table>
+    <thead><tr><th>Idea</th><th class="note">Flag</th><th class="note">What it does</th></tr></thead>
+    <tbody>
+      <tr><td>1a. Label words</td><td class="note"><code>--label-merge-mode wordset</code></td><td class="note">Label merge accepts the same content words in any order</td></tr>
+      <tr><td>1b. Label meaning</td><td class="note"><code>--label-merge-mode semantic</code></td><td class="note">Label merge accepts label embeddings ≥ 0.90 (centroid still ≥ 0.70)</td></tr>
+      <tr><td>2. Shared records</td><td class="note"><code>--overlap-merge-ratio 0.5</code></td><td class="note">Merge when ≥ 50% of the smaller topic's records are also in the other (centroid ≥ 0.70)</td></tr>
+      <tr><td>3. LLM review</td><td class="note"><code>--llm-merge-review</code></td><td class="note">LLM judges close pairs with some redundancy evidence; merges the ones it calls the same (confidence ≥ 0.7)</td></tr>
+      <tr><td>4. Rename apart</td><td class="note"><code>--disambiguate-labels</code></td><td class="note">LLM renames same-brand pairs whose labels collide so they can be told apart; no merging</td></tr>
+      <tr><td>5. Parent groups</td><td class="note"><code>--topic-groups</code></td><td class="note">Groups close siblings (every pair ≥ 0.75) under a parent; no merging</td></tr>
+      <tr><td>6. ID aliases</td><td class="note"><code>--keep-aliases</code></td><td class="note">A merged-away ID stays resolvable as an alias of the survivor, across batches</td></tr>
+      <tr><td>Guards (added after testing)</td><td class="note">automatic; <code>--merge-max-aliases N</code></td><td class="note">A topic that absorbed in one merge step cannot absorb in a later step of the same run; with aliases, a topic holding N absorbed IDs absorbs no more</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Results: stream, mean of 6 batches</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Measure</th><th>Baseline</th><th>1a words</th><th>1b meaning</th><th>2 overlap</th><th>3 review</th><th>4 rename</th><th>5 groups</th><th>2 + 6 aliases</th><th>Best combo</th></tr></thead>
+    <tbody>
+      <tr class="group"><td colspan="10">Duplicates left (same-brand pairs)</td></tr>
+      <tr><td>Identical or same-word labels</td><td>3.7</td><td>2.5</td><td>1.7</td><td>1.0</td><td>1.0</td><td class="better">0</td><td>2.2</td><td>0.2</td><td class="better">0</td></tr>
+      <tr><td>Near-identical labels (≥ 0.85)</td><td>14.8</td><td>12.8</td><td>7.8</td><td>5.7</td><td>7.2</td><td class="better">0.2</td><td>15.0</td><td>5.3</td><td class="better">0</td></tr>
+      <tr><td>≥ 50% shared records</td><td>19.8</td><td>19.7</td><td>18.3</td><td class="better">0.7</td><td>5.8</td><td>20.3</td><td>20.2</td><td class="better">0.8</td><td>6.8</td></tr>
+      <tr class="group"><td colspan="10">Quality (fixed stream30 corpus)</td></tr>
+      <tr><td>Published C_npmi</td><td>0.083</td><td>0.077</td><td>0.087</td><td>0.080</td><td>0.082</td><td>0.080</td><td>0.082</td><td>0.082</td><td>0.089</td></tr>
+      <tr><td>Published C_v</td><td>0.529</td><td>0.527</td><td>0.533</td><td>0.532</td><td>0.536</td><td>0.525</td><td>0.528</td><td>0.533</td><td class="better">0.545</td></tr>
+      <tr><td>Event recall</td><td>0.729</td><td>0.729</td><td>0.730</td><td class="better">0.786</td><td class="better">0.780</td><td>0.728</td><td>0.728</td><td class="better">0.786</td><td class="better">0.779</td></tr>
+      <tr><td>Topics for 80% of an event</td><td>1.83</td><td>1.85</td><td>1.79</td><td>1.72</td><td>1.69</td><td>1.85</td><td>1.85</td><td>1.72</td><td>1.70</td></tr>
+      <tr><td>Inflation (double-counting)</td><td>1.50</td><td>1.50</td><td>1.49</td><td class="better">1.28</td><td>1.32</td><td>1.50</td><td>1.50</td><td class="better">1.28</td><td>1.39</td></tr>
+      <tr><td>Live topics</td><td>119</td><td>121</td><td>114</td><td>80</td><td>89</td><td>123</td><td>121</td><td>80</td><td>92</td></tr>
+      <tr class="group"><td colspan="10">Stability and cost</td></tr>
+      <tr><td>ID retention (plain)</td><td>0.993</td><td>0.993</td><td>0.987</td><td class="worse">0.901</td><td class="worse">0.914</td><td>0.998</td><td>0.994</td><td class="worse">0.901</td><td>0.932</td></tr>
+      <tr><td>ID retention (counting aliases)</td><td>0.993</td><td>0.993</td><td>0.987</td><td class="worse">0.901</td><td class="worse">0.914</td><td>0.998</td><td>0.994</td><td class="better">0.996</td><td class="better">0.997</td></tr>
+      <tr><td>LLM tokens per batch</td><td>38.7k</td><td>42.6k</td><td>38.9k</td><td>32.4k</td><td class="worse">63.4k</td><td>43.5k</td><td>40.5k</td><td>32.9k</td><td>37.9k</td></tr>
+      <tr><td>Brand switches</td><td colspan="9" style="text-align:left">0 in every batch of every version</td></tr>
+    </tbody>
+  </table></div>
+  <p class="caption prose">"Best combo" is overlap + label-meaning merge + rename apart + aliases, with the guards and a cap of 3 absorbed IDs (<code>combo_cheap</code>). Published C_npmi moves within ±0.006 for every idea, which is within the slice's noise: merging a handful of pairs barely changes average coherence. The real effects are in the duplicate counts, event recall and double-counting.</p>
+
+  <h3>Were the merges right? (LLM judge, base run)</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Version</th><th>Merges</th><th>Judged correct</th><th class="note">The ones judged wrong</th></tr></thead>
+    <tbody>
+      <tr><td>1a label words</td><td>1</td><td class="better">1 of 1</td><td class="note">T11 into T8 (the starting case)</td></tr>
+      <tr><td>1b label meaning</td><td>2</td><td class="better">2 of 2</td><td class="note">T11 into T8; Delta "delays & customer service" into "delays & rescheduling"</td></tr>
+      <tr><td>2 overlap</td><td>7</td><td class="worse">5 of 7</td><td class="note">Spotify "iOS playback" into "Login and access" (59% shared); AmericanAir T12 into T8, a cascade: T8 broadened by its first merge, was relabelled to match T12, and the label merge took T12</td></tr>
+      <tr><td>Best combo (with guards)</td><td>7</td><td>6 of 7</td><td class="note">The cascade is gone; the Spotify false positive remains</td></tr>
+      <tr><td>3 LLM review</td><td>7</td><td class="note">not judged</td><td class="note">It rejected the Spotify pair and T8/T12 itself. In the stream it reviewed 14–29 pairs per batch and merged 5–11</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Verdict per idea</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Idea</th><th class="note">Verdict</th><th class="note">Why</th></tr></thead>
+    <tbody>
+      <tr><td>1a. Label words</td><td class="note">Works, tiny reach</td><td class="note">Precise (1/1) but only catches reordered labels, which are rare. Subsumed by 1b.</td></tr>
+      <tr><td>1b. Label meaning</td><td class="note"><strong>Works</strong></td><td class="note">2/2 correct, halves near-identical labels in the stream, no cost (reuses the loaded encoder).</td></tr>
+      <tr><td>2. Shared records</td><td class="note"><strong>Works, needs guards</strong></td><td class="note">Biggest effect of all: double-counting 1.50 → 1.28, event recall +0.057, 16% fewer LLM tokens. On its own it made 2 wrong merges in 7 and dropped ID retention to 0.90. Guards fixed the cascade; aliases fixed retention.</td></tr>
+      <tr><td>3. LLM review</td><td class="note">Works, expensive</td><td class="note">Most precise merge decider, with similar gains to 2, but +64% LLM tokens. Combining it with 4 and 6 (<code>combo</code>) was no better than the cheap combination at 1.8× its cost.</td></tr>
+      <tr><td>4. Rename apart</td><td class="note"><strong>Works</strong></td><td class="note">Removes label collisions completely without merging anything, so stability is untouched (0.998). T8/T11 became "Flight cancellations with boarding and seating issues" and "Flight delays causing missed connections and rebooking problems", which matches what their tweets show. +12% tokens.</td></tr>
+      <tr><td>5. Parent groups</td><td class="note worse">Does not work as built</td><td class="note">Centroids group by domain and tone, not by issue. It grouped "Late or missing order delivery" with "Unclear topic" and "Login and access" with "iOS playback". In the stream, on average 9 of a batch's 17 groups had no label word in common and 5 contained an Unclear topic. It would need label or LLM evidence to be usable.</td></tr>
+      <tr><td>6. ID aliases</td><td class="note"><strong>Works</strong></td><td class="note">Free. Brings alias-aware ID retention back to 0.996–0.997 when merges run, so dashboards and history keep resolving old IDs.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout warn">
+    <strong>Open risks before making the best combo the default.</strong>
+    <ul class="tight">
+      <li><strong>Merged topics keep growing.</strong> The largest topic reached 2,129 records by batch 6, against 1,494 in the baseline. The alias cap limits how many IDs one topic absorbs (it holds at 3), not how big it gets. Check this on the 300k stream.</li>
+      <li><strong>One false positive remains</strong>: Spotify "iOS playback" into "Login and access", 59% shared records. Raising the overlap threshold to 0.6, or routing only 0.5–0.6 pairs through the LLM review, would catch it.</li>
+      <li><strong>Known gap in <code>combo</code>:</strong> the original exact-label merge path does not check the alias cap, so one topic reached 4 absorbed IDs. The recommended combination uses the label-meaning path, which does.</li>
+      <li>This is a 10% slice with one run per version.</li>
+    </ul>
+  </div>
+
+  <div class="callout">
+    <strong>Recommended next step.</strong> Run the best combination on the 200k base and 300k stream:
+    <code>--overlap-merge-ratio 0.5 --label-merge-mode semantic --disambiguate-labels --keep-aliases --merge-max-aliases 3</code>.
+    Check largest-topic growth there before switching it on by default, then port it to the 768 copy.
   </div>
 </section>
 
